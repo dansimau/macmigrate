@@ -29,8 +29,12 @@ var DefaultSkip = []string{
 }
 
 // DefaultRsyncExclude lists rsync --exclude patterns applied to every transfer.
+// A pattern with no slash matches by basename at any depth, so "io.kandji*"
+// skips the Kandji MDM agent's files wherever they appear — they're managed by
+// MDM on the destination and can't be overwritten (Operation not permitted).
 var DefaultRsyncExclude = []string{
 	"*/Caches/",
+	"io.kandji*",
 }
 
 const applicationsDir = "/Applications"
@@ -41,7 +45,24 @@ const applicationsDir = "/Applications"
 // automatically: a directory that is itself listed is split on its own and
 // excluded from its parent's split (so e.g. the large /opt/homebrew/Cellar
 // transfers as many parallel jobs instead of one, with no overlap).
-var DefaultDirs = []string{"/usr/local", "/opt/homebrew", "/opt/homebrew/Cellar"}
+//
+// Besides the Homebrew prefixes, this includes the system-wide /Library items
+// that hold third-party data not under $HOME: app support, fonts, audio plug-ins
+// and presets, ColorSync profiles, system-level launch agents/daemons, and
+// system Services. (The parallelizing of /Library/Application Support — the
+// largest — falls out of the per-subdirectory split.)
+var DefaultDirs = []string{
+	"/usr/local",
+	"/opt/homebrew",
+	"/opt/homebrew/Cellar",
+	"/Library/Application Support",
+	"/Library/Fonts",
+	"/Library/Audio",
+	"/Library/ColorSync",
+	"/Library/LaunchAgents",
+	"/Library/LaunchDaemons",
+	"/Library/Services",
+}
 
 // Job is a single rsync transfer.
 type Job struct {

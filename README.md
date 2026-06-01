@@ -114,12 +114,17 @@ Defaults add to (don't replace) the built-ins:
 - `-exclude`: `.Trash`, `Library/Caches`, `Library/Accounts`,
   `Library/AppleMediaServices`, `Library/Mobile Documents` (iCloud Drive —
   re-syncs from the cloud on the new Mac).
-- `-include`: `/usr/local`, `/opt/homebrew`, `/opt/homebrew/Cellar` — included
-  automatically when they exist locally. Each is copied to the same path on the
-  destination, as root; the root is created if missing but not chowned. Listing a
-  nested pair (like `/opt/homebrew` + `/opt/homebrew/Cellar`) makes the inner one
-  split independently and be skipped by the outer — list any large nested tree to
-  parallelize it. (`-include` paths must exist; missing defaults are silently skipped.)
+- `-include`: the Homebrew prefixes `/usr/local`, `/opt/homebrew`,
+  `/opt/homebrew/Cellar`, plus the system-wide `/Library` items that hold
+  third-party data not under `$HOME` — `/Library/Application Support`,
+  `/Library/Fonts`, `/Library/Audio`, `/Library/ColorSync`,
+  `/Library/LaunchAgents`, `/Library/LaunchDaemons`, `/Library/Services`. All are
+  included automatically when they exist locally. Each is copied to the same path
+  on the destination, as root; the root is created if missing but not chowned.
+  Listing a nested pair (like `/opt/homebrew` + `/opt/homebrew/Cellar`) makes the
+  inner one split independently and be skipped by the outer — list any large
+  nested tree to parallelize it. (`-include` paths must exist; missing defaults
+  are silently skipped.)
 
 ## Output & logging
 
