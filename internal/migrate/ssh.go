@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"al.essio.dev/pkg/shellescape"
-	"macmigrate/internal/xexec"
+	"github.com/dansimau/macmigrate/internal/xexec"
 )
 
 // sshArgv returns the local argv that launches ssh. After the sudo re-exec the

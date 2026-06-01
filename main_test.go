@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"macmigrate/internal/migrate"
+	"github.com/dansimau/macmigrate/internal/migrate"
 )
 
 func TestReportExitCodes(t *testing.T) {

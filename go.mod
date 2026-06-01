@@ -1,4 +1,4 @@
-module macmigrate
+module github.com/dansimau/macmigrate
 
 go 1.25.1
 

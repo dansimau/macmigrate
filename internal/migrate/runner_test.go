@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"testing"
 
-	"macmigrate/internal/display"
+	"github.com/dansimau/macmigrate/internal/display"
 )
 
 func TestClassify(t *testing.T) {

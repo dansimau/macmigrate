@@ -19,9 +19,9 @@ import (
 	"syscall"
 	"time"
 
-	"macmigrate/internal/display"
-	"macmigrate/internal/migrate"
-	"macmigrate/internal/xexec"
+	"github.com/dansimau/macmigrate/internal/display"
+	"github.com/dansimau/macmigrate/internal/migrate"
+	"github.com/dansimau/macmigrate/internal/xexec"
 )
 
 // stringSlice is a repeatable string flag.

@@ -7,8 +7,8 @@ import (
 	"os/exec"
 	"sync"
 
-	"macmigrate/internal/display"
-	"macmigrate/internal/xexec"
+	"github.com/dansimau/macmigrate/internal/display"
+	"github.com/dansimau/macmigrate/internal/xexec"
 )
 
 // maxErrLines caps how much of a failed job's stderr is retained for the
