@@ -6,10 +6,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -35,17 +38,14 @@ func main() {
 }
 
 func run() int {
+	const rsyncBin = "rsync"
+	username := flag.String("user", "", "username whose home (/Users/<user>) to migrate; set automatically when re-running under sudo")
 	dest := flag.String("dest", "", "destination [user@]host (required), e.g. 169.254.190.76")
 	parallel := flag.Int("j", 4, "maximum number of parallel rsync jobs")
-	logPath := flag.String("log", "", "combined log file (default ./macmigrate-<timestamp>.log)")
-	rsyncBin := flag.String("rsync", "rsync", "rsync binary to use")
-	remoteHome := flag.String("remote-home", "", "destination $HOME (default: resolved over ssh)")
 	dryRun := flag.Bool("n", false, "dry run: pass --dry-run to rsync (no files written)")
 
-	var only, excludes, rsyncExcludes, extraDirs stringSlice
-	flag.Var(&only, "only", "limit scope to 'home', 'apps', and/or 'dirs' (repeatable; default all)")
+	var excludes, extraDirs stringSlice
 	flag.Var(&excludes, "exclude", "home/Library entry to skip, e.g. 'Library/Containers' (repeatable; adds to defaults)")
-	flag.Var(&rsyncExcludes, "rsync-exclude", "rsync --exclude pattern (repeatable; adds to defaults)")
 	flag.Var(&extraDirs, "dir", "additional absolute directory to migrate to the same path, as root (repeatable; adds to defaults)")
 	flag.Parse()
 
@@ -56,70 +56,73 @@ func run() int {
 	if *parallel < 1 {
 		return fail("-j must be at least 1")
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return fail("cannot determine home directory: %v", err)
-	}
-	doHome, doApps, doDirs := scope(only)
-	if !doHome && !doApps && !doDirs {
-		return fail("-only must be 'home', 'apps', and/or 'dirs'")
+
+	// macmigrate copies files as root locally so rsync can read every file
+	// regardless of owner or mode. Started without sudo, it re-runs itself under
+	// sudo (which prompts for a password), passing --user so the root instance
+	// knows whose home to migrate.
+	if os.Geteuid() != 0 {
+		return reexecUnderSudo(*username)
 	}
 
-	var dirs []string
-	if doDirs {
-		dirs, err = resolveDirs(migrate.DefaultDirs, extraDirs)
-		if err != nil {
-			return fail("%v", err)
-		}
+	if *username == "" {
+		return fail("-user is required (set automatically when re-running under sudo)")
+	}
+	home := filepath.Join("/Users", *username)
+	if fi, err := os.Stat(home); err != nil || !fi.IsDir() {
+		return fail("home directory %s does not exist", home)
+	}
+
+	dirs, err := resolveDirs(migrate.DefaultDirs, extraDirs)
+	if err != nil {
+		return fail("%v", err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := checkRsync(*rsyncBin); err != nil {
+	if err := checkRsync(rsyncBin); err != nil {
 		return fail("%v", err)
 	}
 
-	rhome := *remoteHome
-	if rhome == "" {
-		fmt.Printf("Connecting to %s …\n", *dest)
-		rhome, err = migrate.RemoteHome(ctx, *dest)
-		if err != nil {
-			return fail("%v\n\nEnable Remote Login on the destination (System Settings ▸ General ▸ Sharing)\nand set up key-based ssh so parallel jobs don't hit password prompts.", err)
-		}
+	// We're root after the sudo re-exec, but ssh must run as the invoking user
+	// so it uses that user's agent/keys rather than root's (which has none).
+	fmt.Printf("Connecting to %s …\n", *dest)
+	rhome, err := migrate.RemoteHome(ctx, *username, *dest)
+	if err != nil {
+		return fail("%v\n\nEnable Remote Login on the destination (System Settings ▸ General ▸ Sharing)\nand set up key-based ssh so parallel jobs don't hit password prompts.", err)
 	}
 
 	// Everything is copied with `sudo rsync` so file ownership is preserved,
 	// which can't prompt for a password across parallel ssh connections. Require
 	// passwordless sudo up front and fail loudly if it's missing.
-	if !*dryRun && !migrate.CanSudo(ctx, *dest) {
+	if !*dryRun && !migrate.CanSudo(ctx, *username, *dest) {
 		return sudoRequiredError(*dest)
 	}
 
 	// Create each additional directory (and any missing parents) on the
 	// destination before its contents are copied; rsync sets the ownership of
 	// the entries inside. A prep failure is fatal — we don't quietly skip work.
-	if doDirs {
-		for _, dir := range dirs {
-			if !*dryRun {
-				fmt.Printf("Preparing %s on %s …\n", dir, *dest)
-			}
-			if err := migrate.PrepareRemoteDir(ctx, *dest, dir, *dryRun); err != nil {
-				return fail("preparing %s on destination: %v", dir, err)
-			}
+	for _, dir := range dirs {
+		if !*dryRun {
+			fmt.Printf("Preparing %s on %s …\n", dir, *dest)
+		}
+		if err := migrate.PrepareRemoteDir(ctx, *username, *dest, dir, *dryRun); err != nil {
+			return fail("preparing %s on destination: %v", dir, err)
 		}
 	}
 
 	opt := migrate.Options{
 		Dest:         *dest,
+		SSHUser:      *username,
 		Home:         home,
 		RemoteHome:   rhome,
 		Dirs:         dirs,
 		SkipNames:    concat(migrate.DefaultSkip, excludes),
-		RsyncExclude: concat(migrate.DefaultRsyncExclude, rsyncExcludes),
-		DoHome:       doHome,
-		DoApps:       doApps,
-		DoDirs:       doDirs && len(dirs) > 0,
+		RsyncExclude: migrate.DefaultRsyncExclude,
+		DoHome:       true,
+		DoApps:       true,
+		DoDirs:       len(dirs) > 0,
 	}
 	jobs, notes, err := migrate.BuildJobs(ctx, opt)
 	if err != nil {
@@ -133,10 +136,7 @@ func run() int {
 		return 0
 	}
 
-	lp := *logPath
-	if lp == "" {
-		lp = fmt.Sprintf("macmigrate-%s.log", time.Now().Format("20060102-150405"))
-	}
+	lp := fmt.Sprintf("macmigrate-%s.log", time.Now().Format("20060102-150405"))
 
 	fmt.Printf("macmigrate → %s  (%s)\n", *dest, rhome)
 	fmt.Printf("  %d jobs · up to %d parallel · log: %s\n", len(jobs), *parallel, lp)
@@ -151,7 +151,7 @@ func run() int {
 	defer disp.Close() // safety net; Close is idempotent
 
 	start := time.Now()
-	results := migrate.Run(ctx, jobs, *parallel, disp, *rsyncBin, *dryRun)
+	results := migrate.Run(ctx, jobs, *parallel, disp, rsyncBin, *dryRun)
 	disp.Close() // tear down the live region before printing the report
 
 	return report(results, lp, time.Since(start), ctx.Err() != nil)
@@ -216,22 +216,52 @@ func report(results []migrate.Result, logPath string, elapsed time.Duration, int
 	}
 }
 
-// scope resolves the -only flags into which categories to copy.
-func scope(only []string) (home, apps, dirs bool) {
-	if len(only) == 0 {
-		return true, true, true
+// reexecUnderSudo re-runs this binary under `sudo`, recording the invoking user
+// via --user so the root instance knows whose home directory to migrate. sudo
+// inherits our stdio, so its password prompt reaches the user's terminal.
+func reexecUnderSudo(userFlag string) int {
+	self, err := os.Executable()
+	if err != nil {
+		return fail("locating own binary: %v", err)
 	}
-	for _, o := range only {
-		switch strings.ToLower(o) {
-		case "home":
-			home = true
-		case "apps", "applications":
-			apps = true
-		case "dirs", "dir":
-			dirs = true
+	username := userFlag
+	if username == "" {
+		username = currentUsername()
+	}
+	if username == "" {
+		return fail("cannot determine the invoking username; pass --user")
+	}
+
+	// -E preserves the environment (notably SSH_AUTH_SOCK / SSH_AGENT_PID) so
+	// the root instance's ssh can talk to the user's ssh-agent. Inject --user
+	// only if the user didn't already pass one (otherwise it's already in args).
+	args := []string{"-E", self}
+	if userFlag == "" {
+		args = append(args, "--user", username)
+	}
+	args = append(args, os.Args[1:]...)
+
+	fmt.Printf("Re-running under sudo as root (migrating /Users/%s) …\n", username)
+	cmd := xexec.Command("sudo", args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return ee.ExitCode()
 		}
+		return fail("running under sudo: %v", err)
 	}
-	return home, apps, dirs
+	return 0
+}
+
+// currentUsername returns the name of the user who invoked macmigrate.
+func currentUsername() string {
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		return u.Username
+	}
+	return os.Getenv("USER")
 }
 
 // resolveDirs builds the additional-directory list: defaults that exist locally,

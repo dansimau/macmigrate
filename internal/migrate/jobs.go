@@ -46,15 +46,17 @@ var DefaultDirs = []string{"/usr/local", "/opt/homebrew", "/opt/homebrew/Cellar"
 
 // Job is a single rsync transfer.
 type Job struct {
-	Label    string   // short name shown in the UI and log, e.g. "Documents" or "Library/Mail"
-	Srcs     []string // local source path(s); a single dir with a trailing slash copies its contents
-	Dst      string   // destination as "[user@]host:/path"
-	Excludes []string // rsync --exclude patterns
+	Label       string   // short name shown in the UI and log, e.g. "Documents" or "Library/Mail"
+	Srcs        []string // local source path(s); a single dir with a trailing slash copies its contents
+	Dst         string   // destination as "[user@]host:/path"
+	Excludes    []string // rsync --exclude patterns
+	RemoteShell string   // rsync -e value (the ssh command); empty leaves rsync's default
 }
 
 // Options controls construction of the job list.
 type Options struct {
 	Dest         string   // [user@]host
+	SSHUser      string   // local user to run ssh as (root drops to it; see sshArgv); "" => plain ssh
 	Home         string   // local $HOME
 	RemoteHome   string   // resolved destination $HOME
 	Dirs         []string // additional absolute directories to migrate (copied to the same path, as root)
@@ -72,6 +74,9 @@ type Options struct {
 // (it can't prompt across parallel ssh connections).
 func (j Job) Args(dryRun bool) []string {
 	args := []string{"-aE", "--info=progress2", "--rsync-path=sudo -n rsync"}
+	if j.RemoteShell != "" {
+		args = append(args, "-e", j.RemoteShell)
+	}
 	if dryRun {
 		args = append(args, "--dry-run")
 	}
@@ -196,20 +201,22 @@ func splitRoot(opt Options, r root, isRoot map[string]bool) ([]Job, error) {
 // directory (trailing slashes on both sides).
 func subdirJob(opt Options, label, localDir, remoteDir string) Job {
 	return Job{
-		Label:    label,
-		Srcs:     []string{ensureSlash(localDir)},
-		Dst:      opt.Dest + ":" + ensureSlash(remoteDir),
-		Excludes: opt.RsyncExclude,
+		Label:       label,
+		Srcs:        []string{ensureSlash(localDir)},
+		Dst:         opt.Dest + ":" + ensureSlash(remoteDir),
+		Excludes:    opt.RsyncExclude,
+		RemoteShell: RsyncRemoteShell(opt.SSHUser),
 	}
 }
 
 // looseFilesJob copies the given top-level files into remoteDir in one transfer.
 func looseFilesJob(opt Options, label string, files []string, remoteDir string) Job {
 	return Job{
-		Label:    label,
-		Srcs:     files,
-		Dst:      opt.Dest + ":" + ensureSlash(remoteDir),
-		Excludes: opt.RsyncExclude,
+		Label:       label,
+		Srcs:        files,
+		Dst:         opt.Dest + ":" + ensureSlash(remoteDir),
+		Excludes:    opt.RsyncExclude,
+		RemoteShell: RsyncRemoteShell(opt.SSHUser),
 	}
 }
 
@@ -217,7 +224,7 @@ func looseFilesJob(opt Options, label string, files []string, remoteDir string) 
 // job per local .app that is not already present — the skip-if-exists behaviour
 // of migrate.sh's copy_apps.
 func appJobs(ctx context.Context, opt Options) ([]Job, []string, error) {
-	existing, err := remoteList(ctx, opt.Dest, applicationsDir)
+	existing, err := remoteList(ctx, opt.SSHUser, opt.Dest, applicationsDir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("listing %s on %s: %w", applicationsDir, opt.Dest, err)
 	}
@@ -237,10 +244,11 @@ func appJobs(ctx context.Context, opt Options) ([]Job, []string, error) {
 			continue
 		}
 		jobs = append(jobs, Job{
-			Label:    "App/" + strings.TrimSuffix(name, ".app"),
-			Srcs:     []string{filepath.Join(applicationsDir, name)}, // no trailing slash: copy the bundle itself
-			Dst:      opt.Dest + ":" + applicationsDir + "/",
-			Excludes: opt.RsyncExclude,
+			Label:       "App/" + strings.TrimSuffix(name, ".app"),
+			Srcs:        []string{filepath.Join(applicationsDir, name)}, // no trailing slash: copy the bundle itself
+			Dst:         opt.Dest + ":" + applicationsDir + "/",
+			Excludes:    opt.RsyncExclude,
+			RemoteShell: RsyncRemoteShell(opt.SSHUser),
 		})
 	}
 	sortJobs(jobs)

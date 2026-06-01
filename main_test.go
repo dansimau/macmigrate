@@ -30,27 +30,6 @@ func TestReportExitCodes(t *testing.T) {
 	}
 }
 
-func TestScope(t *testing.T) {
-	cases := []struct {
-		in               []string
-		home, apps, dirs bool
-	}{
-		{nil, true, true, true},
-		{[]string{"home"}, true, false, false},
-		{[]string{"apps"}, false, true, false},
-		{[]string{"applications"}, false, true, false},
-		{[]string{"dirs"}, false, false, true},
-		{[]string{"home", "apps", "dirs"}, true, true, true},
-		{[]string{"bogus"}, false, false, false},
-	}
-	for _, c := range cases {
-		h, a, d := scope(c.in)
-		if h != c.home || a != c.apps || d != c.dirs {
-			t.Errorf("scope(%v) = (%v, %v, %v), want (%v, %v, %v)", c.in, h, a, d, c.home, c.apps, c.dirs)
-		}
-	}
-}
-
 func TestRsyncVersionParse(t *testing.T) {
 	const sample = "rsync  version 3.4.3  protocol version 32"
 	m := rsyncVersionRE.FindStringSubmatch(sample)

@@ -28,10 +28,25 @@ link (e.g. a Thunderbolt bridge / direct ethernet cable) is actually saturated.
   extended attributes, aggregate progress) — the same flags as the original
   script.
 
+## Running as root locally
+
+macmigrate must run as **root on the source** so `rsync` can read every file
+regardless of owner or mode. You don't run it with `sudo` yourself: started
+normally, it captures your username and **re-runs itself under `sudo -E`** (which
+prompts for your password once and preserves your environment, including
+`SSH_AUTH_SOCK`), passing `--user <you>` so the root instance knows whose home
+(`/Users/<you>`) to migrate.
+
+`rsync` itself runs as root for local reads, but every `ssh` connection (the
+transfer transport and the preflight checks) is launched as **you** via
+`sudo -E -u <you> ssh`, so it uses your ssh-agent, keys and `known_hosts` rather
+than root's (root has none). That means the destination still needs **passwordless
+sudo for your remote login user** — that part runs remotely and is unchanged.
+
 ## Requirements
 
 - **rsync ≥ 3.1** on the source (for `--info=progress2`). macOS's Homebrew
-  `rsync` works; stock `/usr/bin/rsync` may be too old. Override with `-rsync`.
+  `rsync` works; stock `/usr/bin/rsync` may be too old (it must be on `PATH`).
 - **Remote Login (SSH)** enabled on the destination
   (System Settings ▸ General ▸ Sharing), with **key-based auth** set up —
   parallel jobs can't answer password prompts.
@@ -57,21 +72,21 @@ go build -o macmigrate .
 
 ## Usage
 
+Run it **without** `sudo` — it re-runs itself under `sudo` and prompts for your
+password.
+
 ```sh
-# Everything (home + apps) to a directly-connected Mac:
+# Everything (home + apps + default dirs) to a directly-connected Mac:
 ./macmigrate -dest 169.254.190.76
 
 # Preview first — exercises the whole pipeline, writes nothing:
 ./macmigrate -dest 169.254.190.76 -n
 
-# Only user files, 12 parallel jobs:
-./macmigrate -dest user@mac2.local -only home -j 12
+# 12 parallel jobs:
+./macmigrate -dest user@mac2.local -j 12
 
 # Skip an extra Library subdir:
 ./macmigrate -dest mac2.local -exclude Library/Containers
-
-# Only the Homebrew prefixes etc. (default dirs), nothing else:
-./macmigrate -dest mac2.local -only dirs
 
 # Add an extra directory beyond the defaults:
 ./macmigrate -dest mac2.local -dir /etc/nginx
@@ -79,25 +94,20 @@ go build -o macmigrate .
 
 ### Flags
 
-| Flag             | Default                         | Description                                          |
-|------------------|---------------------------------|------------------------------------------------------|
-| `-dest`             | *(required)*                    | Destination `[user@]host`                                |
-| `-j`                | `4`                             | Max parallel rsync jobs                                  |
-| `-only`             | all                             | Limit scope: `home`, `apps`, and/or `dirs` (repeatable)  |
-| `-dir`              | see below                       | Additional absolute directory to migrate (repeatable)    |
-| `-n`                | `false`                         | Dry run (`--dry-run`); writes nothing                    |
-| `-exclude`          | see below                       | `$HOME`-relative entry to skip (repeatable)              |
-| `-rsync-exclude`    | see below                       | rsync `--exclude` pattern (repeatable)                   |
-| `-log`              | `./macmigrate-<timestamp>.log`  | Combined log file                                        |
-| `-rsync`            | `rsync` (from `PATH`)           | rsync binary                                             |
-| `-remote-home`      | resolved over ssh               | Destination `$HOME`                                      |
+| Flag        | Default        | Description                                                                 |
+|-------------|----------------|-----------------------------------------------------------------------------|
+| `-dest`     | *(required)*   | Destination `[user@]host`                                                   |
+| `-j`        | `4`            | Max parallel rsync jobs                                                     |
+| `-dir`      | see below      | Additional absolute directory to migrate (repeatable)                       |
+| `-n`        | `false`        | Dry run (`--dry-run`); writes nothing                                       |
+| `-exclude`  | see below      | `$HOME`-relative entry to skip (repeatable)                                 |
+| `-user`     | invoking user  | Username whose home (`/Users/<user>`) to migrate; set automatically on the sudo re-run |
 
 Defaults add to (don't replace) the built-ins:
 
 - `-exclude`: `.Trash`, `Library/Caches`, `Library/Accounts`,
   `Library/AppleMediaServices`, `Library/Mobile Documents` (iCloud Drive —
   re-syncs from the cloud on the new Mac).
-- `-rsync-exclude`: `.DS_Store`, `*/Caches/`.
 - `-dir`: `/usr/local`, `/opt/homebrew`, `/opt/homebrew/Cellar` — included
   automatically when they exist locally. Each is copied to the same path on the
   destination, as root; the root is created if missing but not chowned. Listing a
