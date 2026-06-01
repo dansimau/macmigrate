@@ -9,18 +9,23 @@ import (
 
 func TestReportExitCodes(t *testing.T) {
 	ok := migrate.Result{Status: migrate.StatusOK}
+	partial := migrate.Result{Status: migrate.StatusPartial, Code: 23, Job: migrate.Job{Label: "Library/Mail"}}
 	failed := migrate.Result{Status: migrate.StatusFailed, Code: 2, Job: migrate.Job{Label: "Documents"}}
 
-	// No failures → success.
+	// Partial transfers exit non-zero so a scripted run notices them.
+	if code := report([]migrate.Result{ok, partial}, "log", time.Second, false); code != 1 {
+		t.Errorf("ok+partial exit = %d, want 1", code)
+	}
+	// No partials, no failures → success.
 	if code := report([]migrate.Result{ok}, "log", time.Second, false); code != 0 {
 		t.Errorf("all ok exit = %d, want 0", code)
 	}
-	// Any failure exits 1.
+	// Hard failures exit 1.
 	if code := report([]migrate.Result{ok, failed}, "log", time.Second, false); code != 1 {
 		t.Errorf("with failure exit = %d, want 1", code)
 	}
 	// Interruption wins.
-	if code := report([]migrate.Result{ok, failed}, "log", time.Second, true); code != 130 {
+	if code := report([]migrate.Result{ok, partial}, "log", time.Second, true); code != 130 {
 		t.Errorf("interrupted exit = %d, want 130", code)
 	}
 }

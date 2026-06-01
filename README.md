@@ -108,18 +108,22 @@ Defaults add to (don't replace) the built-ins:
 ## Output & logging
 
 Each active job shows one live line — `[label] <latest rsync line>` — updated in
-place; finished jobs print a permanent `✓` (done) / `✗` (failed) line above the
-live region. Every job's full output is streamed to the log file (prefixed
-`[label]`). The end-of-run summary reprints full detail for each failure:
+place; finished jobs print a permanent `✓` (done) / `⚠` (partial) / `✗` (failed)
+line above the live region. Every job's full output is streamed to the log file
+(prefixed `[label]`). The end-of-run summary reprints full detail for real
+failures and a per-directory list — with each directory's error lines — for
+partials:
 
 ```
-134 done · 2 failed · 1m2s
+134 done · 32 partial · 0 failed · 1m2s
 Full log: macmigrate-20260602-093000.log
 
-✗ Library/Mail: exit status 23
-    rsync: [sender] opendir failed: Operation not permitted (1)
+⚠ 32 directories had unreadable items (everything else copied):
+    Library/Mail
+        rsync: [sender] send_files failed to open "...": Operation not permitted (1)
     …
-    full output: grep -F '[Library/Mail] ' macmigrate-20260602-093000.log
+  These are macOS privacy-protected (TCC). To include data like Mail, Messages,
+  Safari and Photos, grant Full Disk Access to your terminal, then re-run.
 ```
 
 When stdout isn't a terminal (pipe / CI) the live region degrades to periodic
@@ -127,14 +131,19 @@ plain status lines.
 
 ## Exit codes & protected directories
 
-- **0** — everything copied.
-- **1** — any job failed (non-zero rsync exit).
-- **130** — interrupted.
-
 macOS TCC protects much of `~/Library` and `~/Pictures`. Without Full Disk
 Access, rsync can't read dirs like `Library/Mail` and exits **23** ("partial
-transfer") — macmigrate reports that as a failure with its stderr. To copy that
-protected data, grant **Full Disk Access** to the terminal (System Settings ▸
-Privacy & Security ▸ Full Disk Access) and re-run. A few system stores (e.g.
-`com.apple.TCC`) can never be copied; `-exclude` them.
+transfer"); macmigrate classifies rsync **23/24** as a **partial** — the readable
+data still copied. Process exit code:
+
+- **0** — everything done, no partials or failures.
+- **1** — any hard failure (a non-23/24 rsync error), or any partial transfer
+  (so a scripted run notices protected dirs); partials are surfaced in the
+  summary with their error lines, and the readable data still copied.
+- **130** — interrupted.
+
+To actually copy that protected data, grant **Full Disk Access** to the terminal
+(System Settings ▸ Privacy & Security ▸ Full Disk Access) and re-run — most
+partials disappear. A few system stores (e.g. `com.apple.TCC`) can never be
+copied; `-exclude` them.
 

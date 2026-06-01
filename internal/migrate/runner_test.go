@@ -15,7 +15,7 @@ func TestClassify(t *testing.T) {
 	if s, c := classify(nil); s != StatusOK || c != 0 {
 		t.Errorf("classify(nil) = (%v, %d), want (OK, 0)", s, c)
 	}
-	cases := map[int]Status{23: StatusFailed, 24: StatusFailed, 2: StatusFailed}
+	cases := map[int]Status{23: StatusPartial, 24: StatusPartial, 2: StatusFailed}
 	for code, want := range cases {
 		// Pass the code as $1 rather than interpolating into the script.
 		err := exec.Command("/bin/sh", "-c", `exit "$1"`, "sh", strconv.Itoa(code)).Run()
@@ -61,10 +61,10 @@ func TestRunCopiesLocally(t *testing.T) {
 	}
 }
 
-// TestRunFailedExit23 verifies the runOne→classify path: a job whose rsync
-// exits non-zero (here 23, the macOS-protected-directory case) is reported as a
-// failure, and its stderr is captured for the report.
-func TestRunFailedExit23(t *testing.T) {
+// TestRunPartialExit23 verifies the runOne→classify path: a job whose rsync
+// exits 23 (the macOS-protected-directory case) is reported as a partial, not a
+// failure, and its stderr is still captured.
+func TestRunPartialExit23(t *testing.T) {
 	dir := t.TempDir()
 	fake := filepath.Join(dir, "fakersync")
 	script := "#!/bin/sh\n" +
@@ -85,10 +85,10 @@ func TestRunFailedExit23(t *testing.T) {
 	if len(results) != 1 {
 		t.Fatalf("got %d results, want 1", len(results))
 	}
-	if results[0].Status != StatusFailed || results[0].Code != 23 {
-		t.Fatalf("status=%v code=%d, want Failed/23", results[0].Status, results[0].Code)
+	if results[0].Status != StatusPartial || results[0].Code != 23 {
+		t.Fatalf("status=%v code=%d, want Partial/23", results[0].Status, results[0].Code)
 	}
 	if len(results[0].Stderr) == 0 {
-		t.Error("expected captured stderr lines for the failed job")
+		t.Error("expected captured stderr lines for the partial job")
 	}
 }

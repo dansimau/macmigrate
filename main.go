@@ -158,20 +158,27 @@ func run() int {
 }
 
 // report prints the end-of-run summary and returns the process exit code.
+// Partial transfers (rsync exit 23/24 — typically macOS privacy-protected
+// directories) exit non-zero so a scripted run notices them, with their error
+// lines surfaced in the summary.
 func report(results []migrate.Result, logPath string, elapsed time.Duration, interrupted bool) int {
-	var failed []migrate.Result
+	var partial, failed []migrate.Result
 	ok := 0
 	for _, r := range results {
-		if r.Status == migrate.StatusFailed {
+		switch r.Status {
+		case migrate.StatusPartial:
+			partial = append(partial, r)
+		case migrate.StatusFailed:
 			failed = append(failed, r)
-		} else {
+		default:
 			ok++
 		}
 	}
 
-	fmt.Printf("\n%d done · %d failed · %s\n", ok, len(failed), elapsed.Round(time.Second))
+	fmt.Printf("\n%d done · %d partial · %d failed · %s\n", ok, len(partial), len(failed), elapsed.Round(time.Second))
 	fmt.Printf("Full log: %s\n", logPath)
 
+	// Hard failures get full detail.
 	for _, r := range failed {
 		fmt.Printf("\n✗ %s: %v\n", r.Job.Label, r.Err)
 		for _, line := range r.Stderr {
@@ -180,11 +187,29 @@ func report(results []migrate.Result, logPath string, elapsed time.Duration, int
 		fmt.Printf("    full output: grep -F '[%s] ' %s\n", r.Job.Label, logPath)
 	}
 
+	// Partials get a per-directory list with their error lines and a single
+	// Full Disk Access nudge.
+	if len(partial) > 0 {
+		fmt.Printf("\n⚠ %d director%s had unreadable items (everything else copied):\n",
+			len(partial), plural(len(partial), "y", "ies"))
+		for _, r := range partial {
+			fmt.Printf("    %s\n", r.Job.Label)
+			for _, line := range r.Stderr {
+				fmt.Printf("        %s\n", line)
+			}
+		}
+		fmt.Println("\n  These are macOS privacy-protected (TCC). To include data like Mail,")
+		fmt.Println("  Messages, Safari and Photos, grant Full Disk Access to your terminal:")
+		fmt.Println("    System Settings ▸ Privacy & Security ▸ Full Disk Access")
+		fmt.Println("  then re-run. A few system stores (e.g. com.apple.TCC) can never be copied.")
+		fmt.Printf("  Per-directory errors are in the log: grep -F '[<label>] ' %s\n", logPath)
+	}
+
 	switch {
 	case interrupted:
 		fmt.Println("\nInterrupted before completion.")
 		return 130
-	case len(failed) > 0:
+	case len(failed) > 0, len(partial) > 0:
 		return 1
 	default:
 		return 0
@@ -287,6 +312,13 @@ func sudoRequiredError(dest string) int {
 	fmt.Fprintln(w, "    sudo chmod 440 /etc/sudoers.d/macmigrate")
 	fmt.Fprintln(w, "  (Remove that file once the migration is done.)")
 	return 2
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 func fail(format string, args ...any) int {
