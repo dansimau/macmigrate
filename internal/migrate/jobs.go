@@ -30,7 +30,6 @@ var DefaultSkip = []string{
 
 // DefaultRsyncExclude lists rsync --exclude patterns applied to every transfer.
 var DefaultRsyncExclude = []string{
-	".DS_Store",
 	"*/Caches/",
 }
 

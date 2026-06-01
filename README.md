@@ -14,7 +14,7 @@ link (e.g. a Thunderbolt bridge / direct ethernet cable) is actually saturated.
   (`/usr/local`, `/opt/homebrew`) are copied to the **same absolute path** on the
   destination, one job per subdirectory. The root is created if missing (but not
   chowned — some roots like `/usr/local` are SIP-protected); the entries inside
-  are copied with their own ownership. Add your own with `-dir`.
+  are copied with their own ownership. Add your own with `-include`.
 - **Nested dirs are autodetected.** If you list both a directory and something
   inside it (the default list includes `/opt/homebrew` **and**
   `/opt/homebrew/Cellar`), the inner one is split into its own parallel jobs and
@@ -63,6 +63,12 @@ sudo for your remote login user** — that part runs remotely and is unchanged.
 
   macmigrate checks this up front and exits with this guidance if it's missing.
 - **Full Disk Access** for the terminal running it (to read parts of `~/Library`).
+  macmigrate detects this during preflight (it probes the user's TCC database,
+  which is only readable with FDA) and prints a clear warning if it's missing —
+  the run still proceeds, copying everything that isn't TCC-protected.
+
+During the migration macmigrate keeps **both** Macs awake with `caffeinate -s`
+(local and over ssh on the destination), releasing them when it finishes.
 
 ## Build
 
@@ -89,7 +95,7 @@ password.
 ./macmigrate -dest mac2.local -exclude Library/Containers
 
 # Add an extra directory beyond the defaults:
-./macmigrate -dest mac2.local -dir /etc/nginx
+./macmigrate -dest mac2.local -include /opt/local
 ```
 
 ### Flags
@@ -98,7 +104,7 @@ password.
 |-------------|----------------|-----------------------------------------------------------------------------|
 | `-dest`     | *(required)*   | Destination `[user@]host`                                                   |
 | `-j`        | `4`            | Max parallel rsync jobs                                                     |
-| `-dir`      | see below      | Additional absolute directory to migrate (repeatable)                       |
+| `-include`  | see below      | Additional absolute directory to migrate (repeatable)                       |
 | `-n`        | `false`        | Dry run (`--dry-run`); writes nothing                                       |
 | `-exclude`  | see below      | `$HOME`-relative entry to skip (repeatable)                                 |
 | `-user`     | invoking user  | Username whose home (`/Users/<user>`) to migrate; set automatically on the sudo re-run |
@@ -108,12 +114,12 @@ Defaults add to (don't replace) the built-ins:
 - `-exclude`: `.Trash`, `Library/Caches`, `Library/Accounts`,
   `Library/AppleMediaServices`, `Library/Mobile Documents` (iCloud Drive —
   re-syncs from the cloud on the new Mac).
-- `-dir`: `/usr/local`, `/opt/homebrew`, `/opt/homebrew/Cellar` — included
+- `-include`: `/usr/local`, `/opt/homebrew`, `/opt/homebrew/Cellar` — included
   automatically when they exist locally. Each is copied to the same path on the
   destination, as root; the root is created if missing but not chowned. Listing a
   nested pair (like `/opt/homebrew` + `/opt/homebrew/Cellar`) makes the inner one
   split independently and be skipped by the outer — list any large nested tree to
-  parallelize it. (`-dir` paths must exist; missing defaults are silently skipped.)
+  parallelize it. (`-include` paths must exist; missing defaults are silently skipped.)
 
 ## Output & logging
 

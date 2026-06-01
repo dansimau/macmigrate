@@ -44,9 +44,9 @@ func run() int {
 	parallel := flag.Int("j", 4, "maximum number of parallel rsync jobs")
 	dryRun := flag.Bool("n", false, "dry run: pass --dry-run to rsync (no files written)")
 
-	var excludes, extraDirs stringSlice
+	var excludes, includes stringSlice
 	flag.Var(&excludes, "exclude", "home/Library entry to skip, e.g. 'Library/Containers' (repeatable; adds to defaults)")
-	flag.Var(&extraDirs, "dir", "additional absolute directory to migrate to the same path, as root (repeatable; adds to defaults)")
+	flag.Var(&includes, "include", "additional absolute directory to migrate to the same path, as root (repeatable; adds to defaults)")
 	flag.Parse()
 
 	if *dest == "" {
@@ -73,7 +73,7 @@ func run() int {
 		return fail("home directory %s does not exist", home)
 	}
 
-	dirs, err := resolveDirs(migrate.DefaultDirs, extraDirs)
+	dirs, err := resolveDirs(migrate.DefaultDirs, includes)
 	if err != nil {
 		return fail("%v", err)
 	}
@@ -83,6 +83,19 @@ func run() int {
 
 	if err := checkRsync(rsyncBin); err != nil {
 		return fail("%v", err)
+	}
+
+	// Full Disk Access is a property of the responsible terminal and is
+	// inherited across the sudo re-exec; without it, TCC-protected data is
+	// silently skipped. Warn, but let the run proceed — the rest still copies.
+	switch granted, ok := migrate.FullDiskAccess(home); {
+	case ok && granted:
+		fmt.Println("✓ Full Disk Access granted")
+	case ok && !granted:
+		fmt.Println("⚠ Full Disk Access NOT granted to this terminal — TCC-protected data")
+		fmt.Println("  (Mail, Messages, Safari, Photos) will be skipped. To include it, grant")
+		fmt.Println("  System Settings ▸ Privacy & Security ▸ Full Disk Access to your terminal,")
+		fmt.Println("  then re-run. You can proceed without it.")
 	}
 
 	// We're root after the sudo re-exec, but ssh must run as the invoking user
@@ -149,6 +162,10 @@ func run() int {
 		return fail("opening log file: %v", err)
 	}
 	defer disp.Close() // safety net; Close is idempotent
+
+	// Keep both Macs awake for the whole transfer; stop() lets them sleep again.
+	stopCaffeinate := migrate.Caffeinate(*username, *dest)
+	defer stopCaffeinate()
 
 	start := time.Now()
 	results := migrate.Run(ctx, jobs, *parallel, disp, rsyncBin, *dryRun)
@@ -265,7 +282,7 @@ func currentUsername() string {
 }
 
 // resolveDirs builds the additional-directory list: defaults that exist locally,
-// plus every -dir value (which must exist), de-duplicated and cleaned.
+// plus every -include value (which must exist), de-duplicated and cleaned.
 func resolveDirs(defaults, extra []string) ([]string, error) {
 	seen := map[string]bool{}
 	var out []string
@@ -284,7 +301,7 @@ func resolveDirs(defaults, extra []string) ([]string, error) {
 	for _, d := range extra {
 		fi, err := os.Stat(d)
 		if err != nil || !fi.IsDir() {
-			return nil, fmt.Errorf("-dir %q: not an existing directory", d)
+			return nil, fmt.Errorf("-include %q: not an existing directory", d)
 		}
 		add(d)
 	}
