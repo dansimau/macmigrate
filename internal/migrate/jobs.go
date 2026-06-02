@@ -32,9 +32,14 @@ var DefaultSkip = []string{
 // A pattern with no slash matches by basename at any depth, so "io.kandji*"
 // skips the Kandji MDM agent's files wherever they appear — they're managed by
 // MDM on the destination and can't be overwritten (Operation not permitted).
+// "authorized_keys" keeps the source's ~/.ssh/authorized_keys from clobbering
+// the destination's, which would cut off the very ssh access the migration runs
+// over. (The ~/.ssh transfer is rooted at .ssh/ itself, so a ".ssh/…" pattern
+// would never match — only a basename pattern reaches it.)
 var DefaultRsyncExclude = []string{
 	"*/Caches/",
 	"io.kandji*",
+	"authorized_keys",
 }
 
 const applicationsDir = "/Applications"
@@ -85,6 +90,7 @@ type Options struct {
 	DoHome       bool
 	DoApps       bool
 	DoDirs       bool
+	Debug        bool // emit diagnostics to stderr (see Debugf)
 }
 
 // Args returns the rsync argument list for the job (excluding the binary name).
@@ -248,21 +254,35 @@ func appJobs(ctx context.Context, opt Options) ([]Job, []string, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("listing %s on %s: %w", applicationsDir, opt.Dest, err)
 	}
+	if opt.Debug {
+		names := make([]string, 0, len(existing))
+		for n := range existing {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		Debugf(true, "apps: remote %s on %s has %d entries: %s",
+			applicationsDir, opt.Dest, len(names), strings.Join(names, ", "))
+	}
 	entries, err := os.ReadDir(applicationsDir)
 	if err != nil {
 		return nil, nil, err
 	}
 	var jobs []Job
 	var notes []string
+	ignored := 0
 	for _, e := range entries {
 		name := e.Name()
 		if !strings.HasSuffix(name, ".app") {
+			ignored++
+			Debugf(opt.Debug, "apps: not a .app, ignoring: %s", name)
 			continue
 		}
 		if existing[name] {
+			Debugf(opt.Debug, "apps: exists on destination, skipping: %s", name)
 			notes = append(notes, "SKIP (exists): "+name)
 			continue
 		}
+		Debugf(opt.Debug, "apps: will copy: %s", name)
 		jobs = append(jobs, Job{
 			Label:       "App/" + strings.TrimSuffix(name, ".app"),
 			Srcs:        []string{filepath.Join(applicationsDir, name)}, // no trailing slash: copy the bundle itself
@@ -271,6 +291,8 @@ func appJobs(ctx context.Context, opt Options) ([]Job, []string, error) {
 			RemoteShell: RsyncRemoteShell(opt.SSHUser),
 		})
 	}
+	Debugf(opt.Debug, "apps: local %s has %d entries (%d non-.app ignored): %d to copy, %d skipped",
+		applicationsDir, len(entries), ignored, len(jobs), len(notes))
 	sortJobs(jobs)
 	return jobs, notes, nil
 }

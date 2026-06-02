@@ -33,6 +33,30 @@ func TestJobArgsMultiSource(t *testing.T) {
 	}
 }
 
+// TestDefaultExcludeAuthorizedKeys guards the authorized_keys exclusion: copying
+// the source's ~/.ssh/authorized_keys over the destination's would cut off ssh
+// access mid-migration. The ~/.ssh transfer is rooted at .ssh/, so the pattern
+// must be a bare basename to match.
+func TestDefaultExcludeAuthorizedKeys(t *testing.T) {
+	found := false
+	for _, p := range DefaultRsyncExclude {
+		if p == "authorized_keys" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("DefaultRsyncExclude = %v, missing %q", DefaultRsyncExclude, "authorized_keys")
+	}
+
+	j := Job{Srcs: []string{"/h/.ssh/"}, Dst: "h:/h/.ssh/", Excludes: DefaultRsyncExclude}
+	for _, arg := range j.Args(false) {
+		if arg == "--exclude=authorized_keys" {
+			return
+		}
+	}
+	t.Fatalf("Args = %v, missing --exclude=authorized_keys", j.Args(false))
+}
+
 func TestSplitRoot(t *testing.T) {
 	dir := t.TempDir()
 	for _, d := range []string{"bin", "Cellar"} {

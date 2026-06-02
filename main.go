@@ -43,6 +43,7 @@ func run() int {
 	dest := flag.String("dest", "", "destination [user@]host (required), e.g. 169.254.190.76")
 	parallel := flag.Int("j", 4, "maximum number of parallel rsync jobs")
 	dryRun := flag.Bool("n", false, "dry run: pass --dry-run to rsync (no files written)")
+	debug := flag.Bool("debug", false, "print diagnostics (app selection, full rsync commands) to stderr")
 
 	var excludes, includes stringSlice
 	flag.Var(&excludes, "exclude", "home/Library entry to skip, e.g. 'Library/Containers' (repeatable; adds to defaults)")
@@ -105,6 +106,7 @@ func run() int {
 	if err != nil {
 		return fail("%v\n\nEnable Remote Login on the destination (System Settings ▸ General ▸ Sharing)\nand set up key-based ssh so parallel jobs don't hit password prompts.", err)
 	}
+	migrate.Debugf(*debug, "remote home on %s = %s", *dest, rhome)
 
 	// Everything is copied with `sudo rsync` so file ownership is preserved,
 	// which can't prompt for a password across parallel ssh connections. Require
@@ -136,10 +138,14 @@ func run() int {
 		DoHome:       true,
 		DoApps:       true,
 		DoDirs:       len(dirs) > 0,
+		Debug:        *debug,
 	}
 	jobs, notes, err := migrate.BuildJobs(ctx, opt)
 	if err != nil {
 		return fail("%v", err)
+	}
+	for _, j := range jobs {
+		migrate.Debugf(*debug, "job %s: rsync %s", j.Label, strings.Join(j.Args(*dryRun), " "))
 	}
 	for _, n := range notes {
 		fmt.Println(n)
