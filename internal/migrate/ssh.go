@@ -61,29 +61,41 @@ func RemoteUsername(ctx context.Context, asUser, dest string) (string, error) {
 	return name, nil
 }
 
+// ChownUID resolves, once up front, the uid that the source user's files end
+// up owned by on the destination: rsync maps the owner by name when the source
+// username happens to exist there, and falls back to the source's numeric uid
+// otherwise.
+func ChownUID(ctx context.Context, asUser, dest, srcUser, srcUID string) (string, error) {
+	cmd := fmt.Sprintf("id -u %s 2>/dev/null || echo %s",
+		shellescape.Quote(srcUser), shellescape.Quote(srcUID))
+	out, err := sshCapture(ctx, asUser, dest, cmd)
+	if err != nil {
+		return "", err
+	}
+	uid := strings.TrimSpace(out)
+	if uid == "" {
+		return "", fmt.Errorf("ssh %s: empty uid for %s", dest, srcUser)
+	}
+	return uid, nil
+}
+
 // RunChown runs a job's post-rsync ownership pass on the destination.
-func RunChown(ctx context.Context, c *Chown) error {
-	_, err := sshCapture(ctx, c.SSHUser, c.Dest, chownCmd(c))
+func RunChown(ctx context.Context, asUser, dest string, c *Chown) error {
+	_, err := sshCapture(ctx, asUser, dest, chownCmd(c))
 	return err
 }
 
 // chownCmd builds the remote command for the ownership pass: files under
-// c.Paths owned by the source user are chowned to the destination login user.
-// rsync maps the source owner to the source username if that name happens to
-// exist on the destination, otherwise to the source numeric uid — resolve
-// which one to match before the find. chown -h changes symlinks themselves
-// rather than their targets.
+// c.Path owned by c.UID are chowned to the destination login user — `id -un`
+// is expanded by the login shell before sudo elevates the find. chown -h
+// changes symlinks themselves rather than their targets.
 func chownCmd(c *Chown) string {
-	src := shellescape.Quote(c.SrcUser)
-	var b strings.Builder
-	fmt.Fprintf(&b, "if id -u %s >/dev/null 2>&1; then U=%s; else U=%s; fi; ",
-		src, src, shellescape.Quote(c.SrcUID))
-	b.WriteString("sudo -n find")
-	for _, p := range c.Paths {
-		b.WriteString(" " + shellescape.Quote(p))
+	depth := ""
+	if !c.Recurse {
+		depth = " -maxdepth 1"
 	}
-	fmt.Fprintf(&b, ` -user "$U" -exec chown -h %s {} +`, shellescape.Quote(c.DstUser))
-	return b.String()
+	return "sudo -n find " + shellescape.Quote(c.Path) + depth +
+		" -user " + shellescape.Quote(c.UID) + ` -exec chown -h "$(id -un)" {} +`
 }
 
 // CanSudo reports whether the destination allows passwordless (non-interactive)

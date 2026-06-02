@@ -165,7 +165,7 @@ func TestBuildJobsHomeSplitsLibraryAndSkips(t *testing.T) {
 			t.Errorf("job %s excludes = %v, want defaults", j.Label, j.Excludes)
 		}
 		if j.Chown != nil {
-			t.Errorf("job %s Chown = %+v, want nil (no Options.Chown)", j.Label, j.Chown)
+			t.Errorf("job %s Chown = %+v, want nil (no Options.ChownUID)", j.Label, j.Chown)
 		}
 	}
 }
@@ -184,31 +184,27 @@ func TestBuildJobsChownPaths(t *testing.T) {
 	opt := Options{
 		Dest: "h", SSHUser: "olduser", Home: home, RemoteHome: "/remote",
 		SkipNames: DefaultSkip, RsyncExclude: DefaultRsyncExclude, DoHome: true,
-		Chown: &Chown{SrcUser: "olduser", SrcUID: "501", DstUser: "newuser"},
+		ChownUID: "501",
 	}
 	jobs, _, err := BuildJobs(context.Background(), opt)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Subdir jobs scan their remote directory; the loose-files job lists the
-	// individual files so it never rescans the whole tree.
-	wantPaths := map[string][]string{
-		"Library/Mail": {"/remote/Library/Mail"},
-		"Documents":    {"/remote/Documents"},
-		"home (files)": {"/remote/notes.txt"},
+	// Subdir jobs scan their remote directory recursively; the loose-files job
+	// stays at the top level so it never rescans the whole tree.
+	want := map[string]Chown{
+		"Library/Mail": {Path: "/remote/Library/Mail", UID: "501", Recurse: true},
+		"Documents":    {Path: "/remote/Documents", UID: "501", Recurse: true},
+		"home (files)": {Path: "/remote", UID: "501", Recurse: false},
 	}
 	for _, j := range jobs {
-		c := j.Chown
-		if c == nil {
+		if j.Chown == nil {
 			t.Errorf("job %s: Chown = nil", j.Label)
 			continue
 		}
-		if !reflect.DeepEqual(c.Paths, wantPaths[j.Label]) {
-			t.Errorf("job %s Chown.Paths = %v, want %v", j.Label, c.Paths, wantPaths[j.Label])
-		}
-		if c.SSHUser != "olduser" || c.Dest != "h" || c.SrcUID != "501" || c.DstUser != "newuser" {
-			t.Errorf("job %s Chown = %+v", j.Label, c)
+		if !reflect.DeepEqual(*j.Chown, want[j.Label]) {
+			t.Errorf("job %s Chown = %+v, want %+v", j.Label, *j.Chown, want[j.Label])
 		}
 	}
 }
