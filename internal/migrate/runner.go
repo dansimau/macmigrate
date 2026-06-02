@@ -122,6 +122,15 @@ func runOne(ctx context.Context, slot int, job Job, disp *display.Display, rsync
 
 	disp.FinishSlot(slot)
 	status, code := classify(err)
+	// Second execution: fix ownership of what rsync just wrote (see Chown).
+	// Partial jobs copied most of their files, so they get fixed too. A chown
+	// failure is a failed job — silently wrong ownership is what this prevents.
+	if status != StatusFailed && !dryRun && job.Chown != nil {
+		if cerr := RunChown(ctx, job.Chown); cerr != nil {
+			status = StatusFailed
+			err = fmt.Errorf("fixing ownership: %w", cerr)
+		}
+	}
 	switch status {
 	case StatusPartial:
 		disp.Permanent(fmt.Sprintf("⚠ [%s] partial — some items unreadable (exit %d)", job.Label, code))

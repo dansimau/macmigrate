@@ -115,6 +115,22 @@ func run() int {
 		return sudoRequiredError(*dest)
 	}
 
+	// When the usernames differ, the destination can't map the source owner by
+	// name, so each transfer is followed by a chown pass (see migrate.Chown).
+	var chown *migrate.Chown
+	dstUser, err := migrate.RemoteUsername(ctx, *username, *dest)
+	if err != nil {
+		return fail("resolving destination username: %v", err)
+	}
+	if dstUser != *username {
+		u, err := user.Lookup(*username)
+		if err != nil {
+			return fail("looking up local user %s: %v", *username, err)
+		}
+		chown = &migrate.Chown{SrcUser: *username, SrcUID: u.Uid, DstUser: dstUser}
+		fmt.Printf("Usernames differ (%s → %s): fixing file ownership after each transfer\n", *username, dstUser)
+	}
+
 	// Create each additional directory (and any missing parents) on the
 	// destination before its contents are copied; rsync sets the ownership of
 	// the entries inside. A prep failure is fatal — we don't quietly skip work.
@@ -139,6 +155,7 @@ func run() int {
 		DoApps:       true,
 		DoDirs:       len(dirs) > 0,
 		Debug:        *debug,
+		Chown:        chown,
 	}
 	jobs, notes, err := migrate.BuildJobs(ctx, opt)
 	if err != nil {

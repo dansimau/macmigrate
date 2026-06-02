@@ -164,6 +164,52 @@ func TestBuildJobsHomeSplitsLibraryAndSkips(t *testing.T) {
 		if !reflect.DeepEqual(j.Excludes, DefaultRsyncExclude) {
 			t.Errorf("job %s excludes = %v, want defaults", j.Label, j.Excludes)
 		}
+		if j.Chown != nil {
+			t.Errorf("job %s Chown = %+v, want nil (no Options.Chown)", j.Label, j.Chown)
+		}
+	}
+}
+
+func TestBuildJobsChownPaths(t *testing.T) {
+	home := t.TempDir()
+	for _, d := range []string{"Documents", "Library/Mail"} {
+		if err := os.MkdirAll(filepath.Join(home, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(home, "notes.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	opt := Options{
+		Dest: "h", SSHUser: "olduser", Home: home, RemoteHome: "/remote",
+		SkipNames: DefaultSkip, RsyncExclude: DefaultRsyncExclude, DoHome: true,
+		Chown: &Chown{SrcUser: "olduser", SrcUID: "501", DstUser: "newuser"},
+	}
+	jobs, _, err := BuildJobs(context.Background(), opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Subdir jobs scan their remote directory; the loose-files job lists the
+	// individual files so it never rescans the whole tree.
+	wantPaths := map[string][]string{
+		"Library/Mail": {"/remote/Library/Mail"},
+		"Documents":    {"/remote/Documents"},
+		"home (files)": {"/remote/notes.txt"},
+	}
+	for _, j := range jobs {
+		c := j.Chown
+		if c == nil {
+			t.Errorf("job %s: Chown = nil", j.Label)
+			continue
+		}
+		if !reflect.DeepEqual(c.Paths, wantPaths[j.Label]) {
+			t.Errorf("job %s Chown.Paths = %v, want %v", j.Label, c.Paths, wantPaths[j.Label])
+		}
+		if c.SSHUser != "olduser" || c.Dest != "h" || c.SrcUID != "501" || c.DstUser != "newuser" {
+			t.Errorf("job %s Chown = %+v", j.Label, c)
+		}
 	}
 }
 

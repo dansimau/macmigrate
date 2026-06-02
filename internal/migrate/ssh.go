@@ -48,6 +48,44 @@ func RemoteHome(ctx context.Context, asUser, dest string) (string, error) {
 	return home, nil
 }
 
+// RemoteUsername returns the destination login user's short name.
+func RemoteUsername(ctx context.Context, asUser, dest string) (string, error) {
+	out, err := sshCapture(ctx, asUser, dest, "id -un")
+	if err != nil {
+		return "", err
+	}
+	name := strings.TrimSpace(out)
+	if name == "" {
+		return "", fmt.Errorf("ssh %s: empty `id -un`", dest)
+	}
+	return name, nil
+}
+
+// RunChown runs a job's post-rsync ownership pass on the destination.
+func RunChown(ctx context.Context, c *Chown) error {
+	_, err := sshCapture(ctx, c.SSHUser, c.Dest, chownCmd(c))
+	return err
+}
+
+// chownCmd builds the remote command for the ownership pass: files under
+// c.Paths owned by the source user are chowned to the destination login user.
+// rsync maps the source owner to the source username if that name happens to
+// exist on the destination, otherwise to the source numeric uid — resolve
+// which one to match before the find. chown -h changes symlinks themselves
+// rather than their targets.
+func chownCmd(c *Chown) string {
+	src := shellescape.Quote(c.SrcUser)
+	var b strings.Builder
+	fmt.Fprintf(&b, "if id -u %s >/dev/null 2>&1; then U=%s; else U=%s; fi; ",
+		src, src, shellescape.Quote(c.SrcUID))
+	b.WriteString("sudo -n find")
+	for _, p := range c.Paths {
+		b.WriteString(" " + shellescape.Quote(p))
+	}
+	fmt.Fprintf(&b, ` -user "$U" -exec chown -h %s {} +`, shellescape.Quote(c.DstUser))
+	return b.String()
+}
+
 // CanSudo reports whether the destination allows passwordless (non-interactive)
 // sudo, which the /Applications and additional-directory transfers require.
 func CanSudo(ctx context.Context, asUser, dest string) bool {
