@@ -56,7 +56,7 @@ func classify(err error) (Status, int) {
 // rendering progress through disp. Each worker owns one stable display slot, so
 // the live region shows one line per worker. It returns one Result per job that
 // ran (fewer than len(jobs) if ctx is cancelled mid-run).
-func Run(ctx context.Context, jobs []Job, numWorkers int, disp *display.Display, rsyncBin string, dryRun bool) []Result {
+func Run(ctx context.Context, jobs []Job, numWorkers int, disp *display.Display, rsyncBin, sshUser, dest string, dryRun bool) []Result {
 	if numWorkers < 1 {
 		numWorkers = 1
 	}
@@ -74,7 +74,7 @@ func Run(ctx context.Context, jobs []Job, numWorkers int, disp *display.Display,
 		go func(slot int) {
 			defer wg.Done()
 			for job := range jobCh {
-				res := runOne(ctx, slot, job, disp, rsyncBin, dryRun)
+				res := runOne(ctx, slot, job, disp, rsyncBin, sshUser, dest, dryRun)
 				mu.Lock()
 				results = append(results, res)
 				mu.Unlock()
@@ -95,7 +95,7 @@ dispatch:
 	return results
 }
 
-func runOne(ctx context.Context, slot int, job Job, disp *display.Display, rsyncBin string, dryRun bool) Result {
+func runOne(ctx context.Context, slot int, job Job, disp *display.Display, rsyncBin, sshUser, dest string, dryRun bool) Result {
 	disp.StartSlot(slot, job.Label)
 
 	stdout := display.NewLineWriter(func(line string) {
@@ -122,6 +122,15 @@ func runOne(ctx context.Context, slot int, job Job, disp *display.Display, rsync
 
 	disp.FinishSlot(slot)
 	status, code := classify(err)
+	// Second execution: fix ownership of what rsync just wrote (see Chown).
+	// Partial jobs copied most of their files, so they get fixed too. A chown
+	// failure is a failed job — silently wrong ownership is what this prevents.
+	if status != StatusFailed && !dryRun && job.Chown != nil {
+		if cerr := RunChown(ctx, sshUser, dest, job.Chown); cerr != nil {
+			status = StatusFailed
+			err = fmt.Errorf("fixing ownership: %w", cerr)
+		}
+	}
 	switch status {
 	case StatusPartial:
 		disp.Permanent(fmt.Sprintf("⚠ [%s] partial — some items unreadable (exit %d)", job.Label, code))

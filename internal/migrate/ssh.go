@@ -48,6 +48,56 @@ func RemoteHome(ctx context.Context, asUser, dest string) (string, error) {
 	return home, nil
 }
 
+// RemoteUsername returns the destination login user's short name.
+func RemoteUsername(ctx context.Context, asUser, dest string) (string, error) {
+	out, err := sshCapture(ctx, asUser, dest, "id -un")
+	if err != nil {
+		return "", err
+	}
+	name := strings.TrimSpace(out)
+	if name == "" {
+		return "", fmt.Errorf("ssh %s: empty `id -un`", dest)
+	}
+	return name, nil
+}
+
+// ChownUID resolves, once up front, the uid that the source user's files end
+// up owned by on the destination: rsync maps the owner by name when the source
+// username happens to exist there, and falls back to the source's numeric uid
+// otherwise.
+func ChownUID(ctx context.Context, asUser, dest, srcUser, srcUID string) (string, error) {
+	cmd := fmt.Sprintf("id -u %s 2>/dev/null || echo %s",
+		shellescape.Quote(srcUser), shellescape.Quote(srcUID))
+	out, err := sshCapture(ctx, asUser, dest, cmd)
+	if err != nil {
+		return "", err
+	}
+	uid := strings.TrimSpace(out)
+	if uid == "" {
+		return "", fmt.Errorf("ssh %s: empty uid for %s", dest, srcUser)
+	}
+	return uid, nil
+}
+
+// RunChown runs a job's post-rsync ownership pass on the destination.
+func RunChown(ctx context.Context, asUser, dest string, c *Chown) error {
+	_, err := sshCapture(ctx, asUser, dest, chownCmd(c))
+	return err
+}
+
+// chownCmd builds the remote command for the ownership pass: files under
+// c.Path owned by c.UID are chowned to the destination login user — `id -un`
+// is expanded by the login shell before sudo elevates the find. chown -h
+// changes symlinks themselves rather than their targets.
+func chownCmd(c *Chown) string {
+	depth := ""
+	if !c.Recurse {
+		depth = " -maxdepth 1"
+	}
+	return "sudo -n find " + shellescape.Quote(c.Path) + depth +
+		" -user " + shellescape.Quote(c.UID) + ` -exec chown -h "$(id -un)" {} +`
+}
+
 // CanSudo reports whether the destination allows passwordless (non-interactive)
 // sudo, which the /Applications and additional-directory transfers require.
 func CanSudo(ctx context.Context, asUser, dest string) bool {

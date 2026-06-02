@@ -76,6 +76,29 @@ type Job struct {
 	Dst         string   // destination as "[user@]host:/path"
 	Excludes    []string // rsync --exclude patterns
 	RemoteShell string   // rsync -e value (the ssh command); empty leaves rsync's default
+	Chown       *Chown   // ownership pass run after the transfer; nil when the usernames match
+}
+
+// Chown is the second execution paired with a job's rsync when the source and
+// destination usernames differ: the destination can't map the source owner by
+// name, so the user's files arrive owned by the wrong uid, and this pass flips
+// them to the destination login user. Targeting files owned by that uid leaves
+// root-owned files (e.g. in /Library) untouched, and keeps re-runs cheap:
+// ownership is never part of rsync's file comparison, so a mismatch only ever
+// costs a metadata chown, never a re-copy.
+type Chown struct {
+	Path    string // remote path to scan
+	UID     string // uid that mis-mapped files carry on the destination (probed once; see ChownUID)
+	Recurse bool   // false limits the pass to Path's immediate entries (loose-files jobs)
+}
+
+// chownFor returns the ownership pass for one remote path, or nil when none is
+// needed.
+func chownFor(opt Options, path string, recurse bool) *Chown {
+	if opt.ChownUID == "" {
+		return nil
+	}
+	return &Chown{Path: path, UID: opt.ChownUID, Recurse: recurse}
 }
 
 // Options controls construction of the job list.
@@ -90,14 +113,17 @@ type Options struct {
 	DoHome       bool
 	DoApps       bool
 	DoDirs       bool
-	Debug        bool // emit diagnostics to stderr (see Debugf)
+	Debug        bool   // emit diagnostics to stderr (see Debugf)
+	ChownUID     string // uid for the per-job ownership pass (see Chown); "" when the usernames match
 }
 
 // Args returns the rsync argument list for the job (excluding the binary name).
 // It preserves migrate.sh's flags: archive + extended attributes and a single
 // aggregate progress line. Every transfer runs the remote rsync as root via
 // `sudo -n rsync` so ownership is preserved; `-n` keeps sudo non-interactive
-// (it can't prompt across parallel ssh connections).
+// (it can't prompt across parallel ssh connections). When the source and
+// destination usernames differ, the transfer is followed by a Chown pass —
+// the flags themselves never change.
 func (j Job) Args(dryRun bool) []string {
 	args := []string{"-aE", "--info=progress2", "--rsync-path=sudo -n rsync"}
 	if j.RemoteShell != "" {
@@ -232,10 +258,13 @@ func subdirJob(opt Options, label, localDir, remoteDir string) Job {
 		Dst:         opt.Dest + ":" + ensureSlash(remoteDir),
 		Excludes:    opt.RsyncExclude,
 		RemoteShell: RsyncRemoteShell(opt.SSHUser),
+		Chown:       chownFor(opt, remoteDir, true),
 	}
 }
 
 // looseFilesJob copies the given top-level files into remoteDir in one transfer.
+// Its chown pass stays at remoteDir's top level (no recursion), so it never
+// rescans the subdirectories that other jobs already cover.
 func looseFilesJob(opt Options, label string, files []string, remoteDir string) Job {
 	return Job{
 		Label:       label,
@@ -243,6 +272,7 @@ func looseFilesJob(opt Options, label string, files []string, remoteDir string) 
 		Dst:         opt.Dest + ":" + ensureSlash(remoteDir),
 		Excludes:    opt.RsyncExclude,
 		RemoteShell: RsyncRemoteShell(opt.SSHUser),
+		Chown:       chownFor(opt, remoteDir, false),
 	}
 }
 
@@ -289,6 +319,7 @@ func appJobs(ctx context.Context, opt Options) ([]Job, []string, error) {
 			Dst:         opt.Dest + ":" + applicationsDir + "/",
 			Excludes:    opt.RsyncExclude,
 			RemoteShell: RsyncRemoteShell(opt.SSHUser),
+			Chown:       chownFor(opt, applicationsDir+"/"+name, true), // scoped to the copied bundle
 		})
 	}
 	Debugf(opt.Debug, "apps: local %s has %d entries (%d non-.app ignored): %d to copy, %d skipped",

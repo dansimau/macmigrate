@@ -115,6 +115,26 @@ func run() int {
 		return sudoRequiredError(*dest)
 	}
 
+	// When the usernames differ, the destination can't map the source owner by
+	// name, so each transfer is followed by a chown pass (see migrate.Chown).
+	// Probe once which uid the source user's files arrive as on the destination.
+	var chownUID string
+	dstUser, err := migrate.RemoteUsername(ctx, *username, *dest)
+	if err != nil {
+		return fail("resolving destination username: %v", err)
+	}
+	if dstUser != *username {
+		u, err := user.Lookup(*username)
+		if err != nil {
+			return fail("looking up local user %s: %v", *username, err)
+		}
+		chownUID, err = migrate.ChownUID(ctx, *username, *dest, *username, u.Uid)
+		if err != nil {
+			return fail("resolving source uid on destination: %v", err)
+		}
+		fmt.Printf("Usernames differ (%s → %s): fixing file ownership after each transfer\n", *username, dstUser)
+	}
+
 	// Create each additional directory (and any missing parents) on the
 	// destination before its contents are copied; rsync sets the ownership of
 	// the entries inside. A prep failure is fatal — we don't quietly skip work.
@@ -139,6 +159,7 @@ func run() int {
 		DoApps:       true,
 		DoDirs:       len(dirs) > 0,
 		Debug:        *debug,
+		ChownUID:     chownUID,
 	}
 	jobs, notes, err := migrate.BuildJobs(ctx, opt)
 	if err != nil {
@@ -174,7 +195,7 @@ func run() int {
 	defer stopCaffeinate()
 
 	start := time.Now()
-	results := migrate.Run(ctx, jobs, *parallel, disp, rsyncBin, *dryRun)
+	results := migrate.Run(ctx, jobs, *parallel, disp, rsyncBin, *username, *dest, *dryRun)
 	disp.Close() // tear down the live region before printing the report
 
 	return report(results, lp, time.Since(start), ctx.Err() != nil)
