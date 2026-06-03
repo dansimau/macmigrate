@@ -170,6 +170,73 @@ func TestBuildJobsHomeSplitsLibraryAndSkips(t *testing.T) {
 	}
 }
 
+// TestBuildJobsSSHDirNotRewritten guards the shape of the ~/.ssh transfer: a
+// trailing-slash directory source makes rsync (running as root on the
+// destination) rewrite the destination ~/.ssh's own owner and mode. On a
+// cross-username migration that re-owns it to the source uid, sshd's
+// StrictModes then refuses authorized_keys — cutting off the migration's own
+// ssh access before the chown pass can repair it (the repair needs a new ssh
+// connection, which is exactly what just broke). The .ssh job must therefore
+// list the directory's entries as explicit sources, which never touch the
+// destination directory's own attributes. (rsync still applies --exclude to
+// explicitly listed sources, so authorized_keys stays protected.)
+func TestBuildJobsSSHDirNotRewritten(t *testing.T) {
+	home := t.TempDir()
+	for _, d := range []string{".ssh/keys.d", "Documents", "Library"} {
+		if err := os.MkdirAll(filepath.Join(home, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range []string{".ssh/authorized_keys", ".ssh/config", ".ssh/id_test"} {
+		if err := os.WriteFile(filepath.Join(home, f), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	opt := Options{
+		Dest: "h", Home: home, RemoteHome: "/remote",
+		SkipNames: DefaultSkip, RsyncExclude: DefaultRsyncExclude, DoHome: true,
+		ChownUID: "501",
+	}
+	jobs, _, err := BuildJobs(context.Background(), opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var ssh *Job
+	for i := range jobs {
+		if jobs[i].Label == ".ssh" {
+			ssh = &jobs[i]
+		}
+	}
+	if ssh == nil {
+		t.Fatalf("no .ssh job in %v", labelsOf(jobs))
+	}
+
+	wantSrcs := []string{
+		filepath.Join(home, ".ssh/authorized_keys"), // rsync's --exclude drops it
+		filepath.Join(home, ".ssh/config"),
+		filepath.Join(home, ".ssh/id_test"),
+		filepath.Join(home, ".ssh/keys.d"),
+	}
+	if !reflect.DeepEqual(ssh.Srcs, wantSrcs) {
+		t.Errorf(".ssh job Srcs = %v\nwant explicit entries %v\n(a trailing-slash dir source rewrites the destination ~/.ssh's owner)", ssh.Srcs, wantSrcs)
+	}
+	if want := "h:/remote/.ssh/"; ssh.Dst != want {
+		t.Errorf(".ssh job Dst = %q, want %q", ssh.Dst, want)
+	}
+	if want := (Chown{Path: "/remote/.ssh", UID: "501", Recurse: true}); ssh.Chown == nil || *ssh.Chown != want {
+		t.Errorf(".ssh job Chown = %+v, want %+v", ssh.Chown, want)
+	}
+
+	// Ordinary subdirectories keep the trailing-slash contents transfer.
+	for _, j := range jobs {
+		if j.Label == "Documents" && !reflect.DeepEqual(j.Srcs, []string{filepath.Join(home, "Documents") + "/"}) {
+			t.Errorf("Documents job Srcs = %v, want trailing-slash dir source", j.Srcs)
+		}
+	}
+}
+
 func TestBuildJobsChownPaths(t *testing.T) {
 	home := t.TempDir()
 	for _, d := range []string{"Documents", "Library/Mail"} {
