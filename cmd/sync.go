@@ -8,12 +8,13 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"regexp"
-	"strings"
 	"syscall"
 	"time"
 
+	"al.essio.dev/pkg/shellescape"
 	"github.com/dansimau/macmigrate/internal/display"
 	"github.com/dansimau/macmigrate/internal/migrate"
 	"github.com/dansimau/macmigrate/internal/xexec"
@@ -23,12 +24,14 @@ import (
 const rsyncBin = "rsync"
 
 var (
-	syncUser     string
-	syncParallel int
-	syncDryRun   bool
-	syncIdentity string
-	syncExcludes []string
-	syncIncludes []string
+	syncUser       string
+	syncParallel   int
+	syncDryRun     bool
+	syncIdentity   string
+	syncExcludes   []string
+	syncIncludes   []string
+	syncRoot       string
+	syncRemoteRoot string
 )
 
 var syncCmd = &cobra.Command{
@@ -56,6 +59,10 @@ func init() {
 		"home/Library entry to skip, e.g. 'Library/Containers' (repeatable; adds to defaults)")
 	syncCmd.Flags().StringArrayVar(&syncIncludes, "include", nil,
 		"additional absolute directory to migrate to the same path, as root (repeatable; adds to defaults)")
+	syncCmd.Flags().StringVar(&syncRoot, "root", "/",
+		"local root prefix for the built-in paths (/Users/<user>, /Applications, default dirs); for testing")
+	syncCmd.Flags().StringVar(&syncRemoteRoot, "remote-root", "/",
+		"destination root prefix for the built-in paths; for testing")
 	rootCmd.AddCommand(syncCmd)
 }
 
@@ -75,7 +82,7 @@ func runSync(dest string) error {
 	if syncUser == "" {
 		return fail("--user is required (set automatically when re-running under sudo)")
 	}
-	home := filepath.Join("/Users", syncUser)
+	home := filepath.Join(syncRoot, "Users", syncUser)
 	if fi, err := os.Stat(home); err != nil || !fi.IsDir() {
 		return fail("home directory %s does not exist", home)
 	}
@@ -89,7 +96,7 @@ func runSync(dest string) error {
 	}
 	ssh := migrate.SSH{User: syncUser, Identity: identity}
 
-	dirs, err := resolveDirs(migrate.DefaultDirs, syncIncludes)
+	dirs, err := resolveDirs(syncRoot, migrate.DefaultDirs, syncIncludes)
 	if err != nil {
 		return fail("%v", err)
 	}
@@ -118,6 +125,12 @@ func runSync(dest string) error {
 	rhome, err := ssh.RemoteHome(ctx, dest)
 	if err != nil {
 		return fail("%v\n\nRun `macmigrate setup %s` to configure key-based ssh, or enable Remote Login\non the destination (System Settings ▸ General ▸ Sharing) and set up key-based ssh\nso parallel jobs don't hit password prompts.", err, dest)
+	}
+	if syncRemoteRoot != "/" {
+		// Under a test root the destination home keeps its resolved path —
+		// including the destination user's name, which may differ from the
+		// source's — re-rooted inside the test directory.
+		rhome = path.Join(syncRemoteRoot, rhome)
 	}
 	migrate.Debugf(debug, "remote home on %s = %s", dest, rhome)
 
@@ -152,34 +165,40 @@ func runSync(dest string) error {
 	// destination before its contents are copied; rsync sets the ownership of
 	// the entries inside. A prep failure is fatal — we don't quietly skip work.
 	for _, dir := range dirs {
+		rdir := migrate.RemoteDirPath(syncRoot, syncRemoteRoot, dir)
 		if !syncDryRun {
-			fmt.Printf("Preparing %s on %s …\n", dir, dest)
+			fmt.Printf("Preparing %s on %s …\n", rdir, dest)
 		}
-		if err := ssh.PrepareRemoteDir(ctx, dest, dir, syncDryRun); err != nil {
-			return fail("preparing %s on destination: %v", dir, err)
+		if err := ssh.PrepareRemoteDir(ctx, dest, rdir, syncDryRun); err != nil {
+			return fail("preparing %s on destination: %v", rdir, err)
 		}
 	}
 
 	opt := migrate.Options{
-		Dest:         dest,
-		SSH:          ssh,
-		Home:         home,
-		RemoteHome:   rhome,
-		Dirs:         dirs,
-		SkipNames:    concat(migrate.DefaultSkip, syncExcludes),
-		RsyncExclude: migrate.DefaultRsyncExclude,
-		DoHome:       true,
-		DoApps:       true,
-		DoDirs:       len(dirs) > 0,
-		Debug:        debug,
-		ChownUID:     chownUID,
+		Dest:          dest,
+		SSH:           ssh,
+		Home:          home,
+		RemoteHome:    rhome,
+		AppsDir:       filepath.Join(syncRoot, "Applications"),
+		RemoteAppsDir: path.Join(syncRemoteRoot, "Applications"),
+		Root:          syncRoot,
+		RemoteRoot:    syncRemoteRoot,
+		Dirs:          dirs,
+		SkipNames:     concat(migrate.DefaultSkip, syncExcludes),
+		RsyncExclude:  migrate.DefaultRsyncExclude,
+		DoHome:        true,
+		DoApps:        true,
+		DoDirs:        len(dirs) > 0,
+		Debug:         debug,
+		ChownUID:      chownUID,
 	}
 	jobs, notes, err := migrate.BuildJobs(ctx, opt)
 	if err != nil {
 		return fail("%v", err)
 	}
 	for _, j := range jobs {
-		migrate.Debugf(debug, "job %s: rsync %s", j.Label, strings.Join(j.Args(syncDryRun), " "))
+		// Shell-quoted so multi-word args (--rsync-path, -e) paste back correctly.
+		migrate.Debugf(debug, "job %s: rsync %s", j.Label, shellescape.QuoteCommand(j.Args(syncDryRun)))
 	}
 	for _, n := range notes {
 		fmt.Println(n)
@@ -317,9 +336,10 @@ func reexecUnderSudo(userFlag string) error {
 	return nil
 }
 
-// resolveDirs builds the additional-directory list: defaults that exist locally,
-// plus every --include value (which must exist), de-duplicated and cleaned.
-func resolveDirs(defaults, extra []string) ([]string, error) {
+// resolveDirs builds the additional-directory list: defaults that exist locally
+// (looked up under root), plus every --include value (which must exist and is
+// taken literally), de-duplicated and cleaned.
+func resolveDirs(root string, defaults, extra []string) ([]string, error) {
 	seen := map[string]bool{}
 	var out []string
 	add := func(d string) {
@@ -330,6 +350,7 @@ func resolveDirs(defaults, extra []string) ([]string, error) {
 		}
 	}
 	for _, d := range defaults {
+		d = filepath.Join(root, d)
 		if fi, err := os.Stat(d); err == nil && fi.IsDir() {
 			add(d)
 		}

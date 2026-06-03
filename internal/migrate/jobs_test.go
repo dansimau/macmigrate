@@ -13,7 +13,7 @@ func TestJobArgs(t *testing.T) {
 	j := Job{Srcs: []string{"/a/"}, Dst: "h:/b/", Excludes: []string{".DS_Store"}}
 	got := j.Args(true)
 	want := []string{
-		"-aE", "--info=progress2", "--rsync-path=sudo -n rsync", "--dry-run",
+		"-aE", "--info=progress2", "--rsync-path=sudo -n /usr/bin/rsync", "--dry-run",
 		"--exclude=.DS_Store", "--", "/a/", "h:/b/",
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -25,7 +25,7 @@ func TestJobArgsMultiSource(t *testing.T) {
 	j := Job{Srcs: []string{"/r/.gitignore", "/r/README"}, Dst: "h:/r/"}
 	got := j.Args(false)
 	want := []string{
-		"-aE", "--info=progress2", "--rsync-path=sudo -n rsync",
+		"-aE", "--info=progress2", "--rsync-path=sudo -n /usr/bin/rsync",
 		"--", "/r/.gitignore", "/r/README", "h:/r/",
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -205,6 +205,22 @@ func TestBuildJobsChownPaths(t *testing.T) {
 		}
 		if !reflect.DeepEqual(*j.Chown, want[j.Label]) {
 			t.Errorf("job %s Chown = %+v, want %+v", j.Label, *j.Chown, want[j.Label])
+		}
+	}
+}
+
+func TestRemoteDirPath(t *testing.T) {
+	cases := []struct {
+		root, remoteRoot, localDir, want string
+	}{
+		{"", "", "/usr/local", "/usr/local"},                                 // production defaults: identity
+		{"/", "/", "/Library/Fonts", "/Library/Fonts"},                       // explicit defaults: identity
+		{"/tmp/src", "/tmp/dst", "/tmp/src/usr/local", "/tmp/dst/usr/local"}, // test roots: re-rooted
+		{"/tmp/src", "/", "/tmp/src/Library/Fonts", "/Library/Fonts"},        // strip the local root only
+	}
+	for _, c := range cases {
+		if got := RemoteDirPath(c.root, c.remoteRoot, c.localDir); got != c.want {
+			t.Errorf("RemoteDirPath(%q, %q, %q) = %q, want %q", c.root, c.remoteRoot, c.localDir, got, c.want)
 		}
 	}
 }
