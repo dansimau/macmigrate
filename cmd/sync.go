@@ -94,7 +94,10 @@ func runSync(dest string) error {
 	if err != nil {
 		return fail("%v", err)
 	}
-	ssh := migrate.SSH{User: syncUser, Identity: identity}
+	// BatchMode on every connection sync makes: parallel jobs (and the chown
+	// passes between them) can't answer a password prompt, so an auth failure
+	// mid-run must fail loudly instead of freezing the migration.
+	ssh := migrate.SSH{User: syncUser, Identity: identity, BatchMode: true}
 
 	dirs, err := resolveDirs(syncRoot, migrate.DefaultDirs, syncIncludes)
 	if err != nil {

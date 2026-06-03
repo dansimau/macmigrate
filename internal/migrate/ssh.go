@@ -53,13 +53,16 @@ func (s SSH) prefix() []string {
 
 // RsyncRemoteShell is the value for rsync's -e (the command rsync uses to reach
 // the destination), launching ssh as User the same way prefix does — but never
-// with a pty, since rsync drives many non-interactive connections. It returns ""
-// when neither User nor Identity is set, so the caller leaves rsync's default ssh.
+// with a pty, since rsync drives many non-interactive connections. BatchMode
+// carries over: a transfer connection that can't authenticate must fail
+// loudly, not freeze a parallel job on an invisible password prompt. It
+// returns "" when User, Identity and BatchMode are all unset, so the caller
+// leaves rsync's default ssh.
 func (s SSH) RsyncRemoteShell() string {
-	if s.User == "" && s.Identity == "" {
+	if s.User == "" && s.Identity == "" && !s.BatchMode {
 		return ""
 	}
-	return strings.Join(SSH{User: s.User, Identity: s.Identity}.prefix(), " ")
+	return strings.Join(SSH{User: s.User, Identity: s.Identity, BatchMode: s.BatchMode}.prefix(), " ")
 }
 
 // RemoteHome resolves $HOME on the destination over ssh. It doubles as a

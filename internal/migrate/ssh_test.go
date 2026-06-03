@@ -39,6 +39,10 @@ func TestRsyncRemoteShell(t *testing.T) {
 		// A pty must never leak into rsync's remote shell, even if TTY is set.
 		{"tty is dropped", SSH{User: "alice", Identity: "/k", TTY: true},
 			"sudo -E -u alice ssh -i /k -o IdentitiesOnly=yes"},
+		// BatchMode carries over: a transfer connection that can't authenticate
+		// must fail instead of freezing a parallel job on a password prompt.
+		{"batchmode is kept", SSH{User: "alice", BatchMode: true},
+			"sudo -E -u alice ssh -o BatchMode=yes"},
 	}
 	for _, tc := range cases {
 		if got := tc.ssh.RsyncRemoteShell(); got != tc.want {

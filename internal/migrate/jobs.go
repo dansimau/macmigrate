@@ -34,8 +34,9 @@ var DefaultSkip = []string{
 // MDM on the destination and can't be overwritten (Operation not permitted).
 // "authorized_keys" keeps the source's ~/.ssh/authorized_keys from clobbering
 // the destination's, which would cut off the very ssh access the migration runs
-// over. (The ~/.ssh transfer is rooted at .ssh/ itself, so a ".ssh/…" pattern
-// would never match — only a basename pattern reaches it.)
+// over. (The ~/.ssh transfer lists the directory's entries as explicit sources
+// — see flatDirJob — and rsync applies excludes to explicit sources by their
+// basename, so a bare basename pattern is what reaches it.)
 var DefaultRsyncExclude = []string{
 	"*/Caches/",
 	"io.kandji*",
@@ -221,6 +222,7 @@ type root struct {
 	labelPrefix string          // child label prefix ("" => children labelled by bare name)
 	rootLabel   string          // label for this root's loose-files job
 	skip        map[string]bool // entries to skip (by child label or bare name)
+	flatten     map[string]bool // subdirs copied via explicit entry sources (see flatDirJob)
 }
 
 // buildRoots assembles every directory to split. Home contributes $HOME and
@@ -231,12 +233,18 @@ func buildRoots(opt Options) []root {
 	var home, dirs []root
 	if opt.DoHome {
 		skip := toSet(opt.SkipNames)
-		home = append(home, root{opt.Home, opt.RemoteHome, "", "home", skip})
+		// .ssh is flattened so the destination ~/.ssh directory's own owner and
+		// mode are never rewritten — sshd's StrictModes would refuse
+		// authorized_keys and cut off the migration's own ssh access.
+		home = append(home, root{
+			local: opt.Home, remote: opt.RemoteHome, rootLabel: "home",
+			skip: skip, flatten: map[string]bool{".ssh": true},
+		})
 		if !skip["Library"] {
 			home = append(home, root{
-				filepath.Join(opt.Home, "Library"),
-				path.Join(opt.RemoteHome, "Library"),
-				"Library", "Library", skip,
+				local:       filepath.Join(opt.Home, "Library"),
+				remote:      path.Join(opt.RemoteHome, "Library"),
+				labelPrefix: "Library", rootLabel: "Library", skip: skip,
 			})
 		}
 	}
@@ -246,7 +254,10 @@ func buildRoots(opt Options) []root {
 			// Label by the path relative to Root so it stays stable ("usr/local")
 			// even when the local root is a temporary test directory.
 			rel := strings.TrimPrefix(RemoteDirPath(opt.Root, "/", d), "/")
-			dirs = append(dirs, root{d, RemoteDirPath(opt.Root, opt.RemoteRoot, d), rel, rel, nil})
+			dirs = append(dirs, root{
+				local: d, remote: RemoteDirPath(opt.Root, opt.RemoteRoot, d),
+				labelPrefix: rel, rootLabel: rel,
+			})
 		}
 	}
 	deepestFirst(home)
@@ -280,6 +291,16 @@ func splitRoot(opt Options, r root, isRoot map[string]bool) ([]Job, error) {
 			if isRoot[childLocal] {
 				continue // split by its own root entry — don't copy it here too
 			}
+			if r.flatten[name] {
+				j, err := flatDirJob(opt, label, childLocal, path.Join(r.remote, name))
+				if err != nil {
+					return nil, err
+				}
+				if j != nil {
+					jobs = append(jobs, *j)
+				}
+				continue
+			}
 			jobs = append(jobs, subdirJob(opt, label, childLocal, path.Join(r.remote, name)))
 		} else {
 			files = append(files, childLocal)
@@ -304,6 +325,39 @@ func subdirJob(opt Options, label, localDir, remoteDir string) Job {
 		RemoteShell: opt.SSH.RsyncRemoteShell(),
 		Chown:       chownFor(opt, remoteDir, true),
 	}
+}
+
+// flatDirJob copies the contents of one subdirectory by listing its entries as
+// explicit rsync sources, so the destination directory's own owner and mode
+// are never transferred (rsync only rewrites a destination directory's
+// attributes for a trailing-slash directory source). Used for ~/.ssh: rsync
+// runs as root on the destination, and re-owning ~/.ssh — to the source uid on
+// a cross-username migration — trips sshd's StrictModes, which refuses
+// authorized_keys and cuts off the very ssh access the remaining jobs and the
+// repairing chown pass need. rsync still applies --exclude patterns to
+// explicit sources, so authorized_keys stays protected; the chown pass covers
+// the copied contents. Returns nil for an empty directory.
+func flatDirJob(opt Options, label, localDir, remoteDir string) (*Job, error) {
+	entries, err := os.ReadDir(localDir)
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	srcs := make([]string, 0, len(entries))
+	for _, e := range entries {
+		srcs = append(srcs, filepath.Join(localDir, e.Name()))
+	}
+	sort.Strings(srcs)
+	return &Job{
+		Label:       label,
+		Srcs:        srcs,
+		Dst:         opt.Dest + ":" + ensureSlash(remoteDir),
+		Excludes:    opt.RsyncExclude,
+		RemoteShell: opt.SSH.RsyncRemoteShell(),
+		Chown:       chownFor(opt, remoteDir, true),
+	}, nil
 }
 
 // looseFilesJob copies the given top-level files into remoteDir in one transfer.
