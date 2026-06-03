@@ -127,9 +127,10 @@ func runSync(dest string) error {
 		return fail("%v\n\nRun `macmigrate setup %s` to configure key-based ssh, or enable Remote Login\non the destination (System Settings ▸ General ▸ Sharing) and set up key-based ssh\nso parallel jobs don't hit password prompts.", err, dest)
 	}
 	if syncRemoteRoot != "/" {
-		// Under a test root the destination "home" lives inside it; the ssh
-		// resolution above still serves as the connectivity preflight.
-		rhome = path.Join(syncRemoteRoot, "Users", syncUser)
+		// Under a test root the destination home keeps its resolved path —
+		// including the destination user's name, which may differ from the
+		// source's — re-rooted inside the test directory.
+		rhome = path.Join(syncRemoteRoot, rhome)
 	}
 	migrate.Debugf(debug, "remote home on %s = %s", dest, rhome)
 

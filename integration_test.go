@@ -41,6 +41,8 @@ import (
 const (
 	testUser       = "macmigratetest"
 	testHome       = "/Users/" + testUser
+	testUser2      = "macmigratetest2" // destination user for the cross-username test
+	testHome2      = "/Users/" + testUser2
 	sudoersPath    = "/etc/sudoers.d/macmigrate-test"
 	fixturesDir    = "test/fixtures"
 	harnessKeyName = "harness_key" // non-standard on purpose; see provisionTestUser
@@ -53,6 +55,8 @@ var (
 	binPath   string
 	testUID   int
 	testGID   int
+	test2UID  int
+	test2GID  int
 )
 
 func TestMain(m *testing.M) {
@@ -62,6 +66,7 @@ func TestMain(m *testing.M) {
 	}
 	if os.Getenv("MACMIGRATE_TEST_CLEANUP") == "1" && os.Geteuid() == 0 {
 		exec.Command("sysadminctl", "-deleteUser", testUser).Run()
+		exec.Command("sysadminctl", "-deleteUser", testUser2).Run()
 		os.Remove(sudoersPath)
 		os.Remove(migrate.SudoersPath) // in case a setup test failed mid-way
 	}
@@ -114,33 +119,12 @@ func buildBinary() error {
 // real uid's passwd entry — not $HOME — so `sudo -E -u macmigratetest ssh`
 // reads exactly the files provisioned here.
 func provisionTestUser() error {
-	if exec.Command("dscl", ".", "-read", testHome).Run() != nil {
-		pw, err := randomHex(16)
-		if err != nil {
-			return err
-		}
-		if err := runCmd("sysadminctl", "-addUser", testUser, "-fullName", "macmigrate integration test",
-			"-password", pw, "-home", testHome, "-shell", "/bin/zsh"); err != nil {
-			return fmt.Errorf("creating user %s: %w", testUser, err)
-		}
-		if err := runCmd("createhomedir", "-c", "-u", testUser); err != nil {
-			return fmt.Errorf("creating home for %s: %w", testUser, err)
-		}
+	if err := ensureUser(testUser, testHome); err != nil {
+		return err
 	}
 	var err error
-	if testUID, err = idOf("-u"); err != nil {
+	if testUID, testGID, err = idsOf(testUser); err != nil {
 		return err
-	}
-	if testGID, err = idOf("-g"); err != nil {
-		return err
-	}
-
-	// Remote Login can be limited to members of com.apple.access_ssh; when the
-	// group exists, a user outside it is refused even with a valid key.
-	if exec.Command("dseditgroup", "-o", "read", "com.apple.access_ssh").Run() == nil {
-		if err := runCmd("dseditgroup", "-o", "edit", "-a", testUser, "-t", "user", "com.apple.access_ssh"); err != nil {
-			return fmt.Errorf("adding %s to com.apple.access_ssh: %w", testUser, err)
-		}
 	}
 
 	sshDir := filepath.Join(testHome, ".ssh")
@@ -194,27 +178,95 @@ func provisionTestUser() error {
 		return err
 	}
 
+	// The second user is the DESTINATION of the cross-username test. It is
+	// reachable with the same harness key (the source user's ssh carries the
+	// identity; the destination only needs the public key authorized) and can
+	// sudo, but has no keys or config of its own.
+	if err := ensureUser(testUser2, testHome2); err != nil {
+		return err
+	}
+	if test2UID, test2GID, err = idsOf(testUser2); err != nil {
+		return err
+	}
+	ssh2 := filepath.Join(testHome2, ".ssh")
+	if err := os.MkdirAll(ssh2, 0o700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(ssh2, "authorized_keys"), pub, 0o600); err != nil {
+		return err
+	}
+	if err := runCmd("chown", "-R", fmt.Sprintf("%d:%d", test2UID, test2GID), ssh2); err != nil {
+		return err
+	}
+
 	if err := installSudoers(); err != nil {
 		return err
 	}
 
 	// Smoke-test the full destination path the tool depends on: key-based ssh
-	// as the test user, then passwordless sudo on the "remote".
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// as the test user, then passwordless sudo on the "remote" — against both
+	// destination users.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	smoke := exec.CommandContext(ctx, "sudo", "-u", testUser, "ssh", testUser+"@localhost", "sudo -n true")
-	if out, err := smoke.CombinedOutput(); err != nil {
-		return fmt.Errorf("ssh+sudo smoke test failed (Remote Login enabled? MDM restrictions?): %v: %s", err, bytes.TrimSpace(out))
+	for _, dst := range []string{testUser, testUser2} {
+		smoke := exec.CommandContext(ctx, "sudo", "-u", testUser, "ssh", dst+"@localhost", "sudo -n true")
+		if out, err := smoke.CombinedOutput(); err != nil {
+			return fmt.Errorf("ssh+sudo smoke test to %s failed (Remote Login enabled? MDM restrictions?): %v: %s",
+				dst, err, bytes.TrimSpace(out))
+		}
 	}
 	return nil
 }
 
-// installSudoers grants the test user passwordless sudo on the "destination",
-// which the remote `sudo -n /usr/bin/rsync` / `sudo -n mkdir` require. The file
-// is validated before install; the temporary name contains a dot, which sudo's
-// includedir ignores.
+// ensureUser creates a local macOS user with a home directory and (when Remote
+// Login is restricted to com.apple.access_ssh members) ssh access. Idempotent:
+// an existing user is left untouched. The full name is the short name itself —
+// full names must be unique, so a shared label would make the second user's
+// creation fail. sysadminctl is also notorious for exiting 0 on failure, so the
+// record is verified (with a short retry for Open Directory propagation)
+// rather than trusting the exit code.
+func ensureUser(name, home string) error {
+	if !userExists(name) {
+		pw, err := randomHex(16)
+		if err != nil {
+			return err
+		}
+		out, err := exec.Command("sysadminctl", "-addUser", name, "-fullName", name,
+			"-password", pw, "-home", home, "-shell", "/bin/zsh").CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("creating user %s: %v: %s", name, err, bytes.TrimSpace(out))
+		}
+		for i := 0; i < 20 && !userExists(name); i++ {
+			time.Sleep(250 * time.Millisecond)
+		}
+		if !userExists(name) {
+			return fmt.Errorf("sysadminctl reported success but %s does not exist: %s", name, bytes.TrimSpace(out))
+		}
+		if err := runCmd("createhomedir", "-c", "-u", name); err != nil {
+			return fmt.Errorf("creating home for %s: %w", name, err)
+		}
+	}
+	// Remote Login can be limited to members of com.apple.access_ssh; when the
+	// group exists, a user outside it is refused even with a valid key.
+	if exec.Command("dseditgroup", "-o", "read", "com.apple.access_ssh").Run() == nil {
+		if err := runCmd("dseditgroup", "-o", "edit", "-a", name, "-t", "user", "com.apple.access_ssh"); err != nil {
+			return fmt.Errorf("adding %s to com.apple.access_ssh: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func userExists(name string) bool {
+	return exec.Command("dscl", ".", "-read", "/Users/"+name).Run() == nil
+}
+
+// installSudoers grants both test users passwordless sudo on the "destination",
+// which the remote `sudo -n /usr/bin/rsync` / `sudo -n mkdir` / the chown pass
+// require. The file is validated before install; the temporary name contains a
+// dot, which sudo's includedir ignores.
 func installSudoers() error {
-	content := testUser + " ALL=(ALL) NOPASSWD: ALL\n"
+	content := testUser + " ALL=(ALL) NOPASSWD: ALL\n" +
+		testUser2 + " ALL=(ALL) NOPASSWD: ALL\n"
 	if cur, err := os.ReadFile(sudoersPath); err == nil && string(cur) == content {
 		return nil
 	}
@@ -229,12 +281,17 @@ func installSudoers() error {
 	return os.Rename(tmp, sudoersPath)
 }
 
-func idOf(flag string) (int, error) {
-	out, err := exec.Command("id", flag, testUser).Output()
-	if err != nil {
-		return 0, fmt.Errorf("id %s %s: %w", flag, testUser, err)
+func idsOf(name string) (uid, gid int, err error) {
+	for flag, dst := range map[string]*int{"-u": &uid, "-g": &gid} {
+		out, err := exec.Command("id", flag, name).Output()
+		if err != nil {
+			return 0, 0, fmt.Errorf("id %s %s: %w", flag, name, err)
+		}
+		if *dst, err = strconv.Atoi(strings.TrimSpace(string(out))); err != nil {
+			return 0, 0, err
+		}
 	}
-	return strconv.Atoi(strings.TrimSpace(string(out)))
+	return uid, gid, nil
 }
 
 func randomHex(n int) (string, error) {
@@ -291,8 +348,15 @@ func newFixture(t *testing.T) *fixture {
 // --rsync-path — the version pairing of a real old-Mac migration.
 func (f *fixture) runMigrate(t *testing.T, extra ...string) (string, int) {
 	t.Helper()
+	return f.runMigrateTo(t, testUser+"@localhost", extra...)
+}
+
+// runMigrateTo is runMigrate with an explicit destination, for migrations to a
+// different destination user.
+func (f *fixture) runMigrateTo(t *testing.T, dest string, extra ...string) (string, int) {
+	t.Helper()
 	args := []string{
-		"sync", testUser + "@localhost",
+		"sync", dest,
 		"--user", testUser,
 		"--root", f.localRoot,
 		"--remote-root", f.remoteRoot,
@@ -409,6 +473,20 @@ func assertAbsent(t *testing.T, path string) {
 	t.Helper()
 	if _, err := os.Lstat(path); err == nil {
 		t.Errorf("%s should not have been copied", path)
+	}
+}
+
+func chownPath(t *testing.T, path string, uid, gid int) {
+	t.Helper()
+	if err := os.Chown(path, uid, gid); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func chownTree(t *testing.T, root string, uid, gid int) {
+	t.Helper()
+	if err := runCmd("chown", "-R", fmt.Sprintf("%d:%d", uid, gid), root); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -547,6 +625,68 @@ func TestIntegrationDryRun(t *testing.T) {
 	assertAbsent(t, filepath.Join(f.remoteHome, "Documents"))
 	assertAbsent(t, filepath.Join(f.remoteRoot, "Applications/Foo.app"))
 	assertAbsent(t, filepath.Join(f.remoteRoot, "Library/Fonts"))
+}
+
+// TestIntegrationCrossUserChown migrates to a DIFFERENT destination username —
+// the scenario the post-rsync chown pass exists for. Files owned by the source
+// user must arrive owned by the destination login user (rsync alone would
+// leave them under the source uid), while files owned by anyone else (root,
+// daemon) keep their owner: the pass targets only the probed source uid.
+func TestIntegrationCrossUserChown(t *testing.T) {
+	f := newFixture(t)
+	// The destination user's home skeleton, as newFixture builds for testUser.
+	remoteHome2 := filepath.Join(f.remoteRoot, "Users", testUser2)
+	if err := os.MkdirAll(filepath.Join(remoteHome2, "Library"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// The source user owns their home content, as on a real Mac; root- and
+	// daemon-owned files prove the pass leaves other owners alone.
+	for _, p := range []string{
+		"Documents", "Documents/report.txt", "Documents/sub", "Documents/sub/deep.txt",
+		"notes.txt", "owned", "owned/user.txt",
+	} {
+		chownPath(t, filepath.Join(f.home, p), testUID, testGID)
+	}
+	chownPath(t, filepath.Join(f.home, "owned/root.txt"), 0, 0)
+	chownPath(t, filepath.Join(f.home, "owned/daemon.txt"), 1, 1)
+	// An app bundle owned by the source user exercises the app job's own
+	// (bundle-scoped) chown pass.
+	chownTree(t, filepath.Join(f.localRoot, "Applications/Foo.app"), testUID, testGID)
+
+	out, code := f.runMigrateTo(t, testUser2+"@localhost")
+	assertSuccess(t, out, code)
+	if want := fmt.Sprintf("Usernames differ (%s → %s)", testUser, testUser2); !strings.Contains(out, want) {
+		t.Errorf("output missing %q — chown pass not announced", want)
+	}
+
+	// Everything the source user owned now belongs to the destination user.
+	for _, p := range []string{
+		"Documents", "Documents/report.txt", "Documents/sub/deep.txt",
+		"notes.txt", "owned/user.txt",
+	} {
+		if uid, _ := statUIDGID(t, filepath.Join(remoteHome2, p)); uid != test2UID {
+			t.Errorf("%s owned by uid %d, want %s (%d)", p, uid, testUser2, test2UID)
+		}
+	}
+	for _, app := range []string{"Applications/Foo.app", "Applications/Foo.app/Contents/Info.plist"} {
+		if uid, _ := statUIDGID(t, filepath.Join(f.remoteRoot, app)); uid != test2UID {
+			t.Errorf("%s owned by uid %d, want %s (%d)", app, uid, testUser2, test2UID)
+		}
+	}
+
+	// Other owners are untouched: the pass chowns only the source uid's files.
+	if uid, _ := statUIDGID(t, filepath.Join(remoteHome2, "owned/root.txt")); uid != 0 {
+		t.Errorf("root.txt owned by uid %d, want 0", uid)
+	}
+	if uid, _ := statUIDGID(t, filepath.Join(remoteHome2, "owned/daemon.txt")); uid != 1 {
+		t.Errorf("daemon.txt owned by uid %d, want 1", uid)
+	}
+	// Root-owned at the source but inside $HOME: root is not the probed uid, so
+	// it keeps its owner — as stray root-owned files in a real home would.
+	if uid, _ := statUIDGID(t, filepath.Join(remoteHome2, ".hushlogin")); uid != 0 {
+		t.Errorf(".hushlogin owned by uid %d, want 0 (root-owned at source)", uid)
+	}
 }
 
 // TestIntegrationSetupAndCleanup drives the full provision/undo cycle as the
