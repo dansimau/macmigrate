@@ -42,7 +42,10 @@ var DefaultRsyncExclude = []string{
 	"authorized_keys",
 }
 
-const applicationsDir = "/Applications"
+// defaultApplicationsDir is where third-party apps live on both Macs unless
+// overridden through Options (used by the integration tests to point both
+// sides at temporary roots).
+const defaultApplicationsDir = "/Applications"
 
 // DefaultDirs are absolute directories migrated in addition to $HOME and
 // /Applications when they exist locally. Each is copied to the same absolute
@@ -103,29 +106,68 @@ func chownFor(opt Options, path string, recurse bool) *Chown {
 
 // Options controls construction of the job list.
 type Options struct {
-	Dest         string   // [user@]host
-	SSH          SSH      // how to reach the destination over ssh (user/identity)
-	Home         string   // local $HOME
-	RemoteHome   string   // resolved destination $HOME
-	Dirs         []string // additional absolute directories to migrate (copied to the same path, as root)
-	SkipNames    []string // home/Library entries to skip (relative to $HOME)
-	RsyncExclude []string // rsync --exclude patterns applied to every job
-	DoHome       bool
-	DoApps       bool
-	DoDirs       bool
-	Debug        bool   // emit diagnostics to stderr (see Debugf)
-	ChownUID     string // uid for the per-job ownership pass (see Chown); "" when the usernames match
+	Dest          string   // [user@]host
+	SSH           SSH      // how to reach the destination over ssh (user/identity)
+	Home          string   // local $HOME
+	RemoteHome    string   // resolved destination $HOME
+	AppsDir       string   // local Applications directory; "" => /Applications
+	RemoteAppsDir string   // destination Applications directory; "" => /Applications
+	Root          string   // local root prefix for built-in paths; "" => /
+	RemoteRoot    string   // destination root prefix for built-in paths; "" => /
+	Dirs          []string // additional absolute directories to migrate (re-rooted per Root/RemoteRoot, as root)
+	SkipNames     []string // home/Library entries to skip (relative to $HOME)
+	RsyncExclude  []string // rsync --exclude patterns applied to every job
+	DoHome        bool
+	DoApps        bool
+	DoDirs        bool
+	Debug         bool   // emit diagnostics to stderr (see Debugf)
+	ChownUID      string // uid for the per-job ownership pass (see Chown); "" when the usernames match
+}
+
+func (o Options) appsDir() string {
+	if o.AppsDir == "" {
+		return defaultApplicationsDir
+	}
+	return o.AppsDir
+}
+
+func (o Options) remoteAppsDir() string {
+	if o.RemoteAppsDir == "" {
+		return defaultApplicationsDir
+	}
+	return o.RemoteAppsDir
+}
+
+// RemoteDirPath maps a local directory to its destination path: localDir
+// relative to root, re-rooted at remoteRoot. With the default roots ("" or
+// "/") a directory keeps its absolute path, which is the production
+// behaviour; the roots only differ under the integration tests.
+func RemoteDirPath(root, remoteRoot, localDir string) string {
+	if root == "" {
+		root = "/"
+	}
+	if remoteRoot == "" {
+		remoteRoot = "/"
+	}
+	rel, err := filepath.Rel(root, localDir)
+	if err != nil {
+		return localDir
+	}
+	return path.Join(remoteRoot, rel)
 }
 
 // Args returns the rsync argument list for the job (excluding the binary name).
 // It preserves migrate.sh's flags: archive + extended attributes and a single
 // aggregate progress line. Every transfer runs the remote rsync as root via
-// `sudo -n rsync` so ownership is preserved; `-n` keeps sudo non-interactive
-// (it can't prompt across parallel ssh connections). When the source and
-// destination usernames differ, the transfer is followed by a Chown pass —
-// the flags themselves never change.
+// `sudo -n /usr/bin/rsync` so ownership is preserved; `-n` keeps sudo
+// non-interactive (it can't prompt across parallel ssh connections), and the
+// explicit path pins the stock Apple rsync — the non-interactive ssh PATH
+// wouldn't find a Homebrew one anyway, and the local rsync 3 interoperates
+// with it. (--info=progress2 is interpreted by the local side only.) When the
+// source and destination usernames differ, the transfer is followed by a
+// Chown pass — the flags themselves never change.
 func (j Job) Args(dryRun bool) []string {
-	args := []string{"-aE", "--info=progress2", "--rsync-path=sudo -n rsync"}
+	args := []string{"-aE", "--info=progress2", "--rsync-path=sudo -n /usr/bin/rsync"}
 	if j.RemoteShell != "" {
 		args = append(args, "-e", j.RemoteShell)
 	}
@@ -201,8 +243,10 @@ func buildRoots(opt Options) []root {
 	if opt.DoDirs {
 		for _, d := range opt.Dirs {
 			d = filepath.Clean(d)
-			rel := strings.TrimPrefix(d, "/")
-			dirs = append(dirs, root{d, d, rel, rel, nil})
+			// Label by the path relative to Root so it stays stable ("usr/local")
+			// even when the local root is a temporary test directory.
+			rel := strings.TrimPrefix(RemoteDirPath(opt.Root, "/", d), "/")
+			dirs = append(dirs, root{d, RemoteDirPath(opt.Root, opt.RemoteRoot, d), rel, rel, nil})
 		}
 	}
 	deepestFirst(home)
@@ -277,12 +321,11 @@ func looseFilesJob(opt Options, label string, files []string, remoteDir string) 
 }
 
 // appJobs lists the destination's /Applications, then creates one sudo-rsync
-// job per local .app that is not already present — the skip-if-exists behaviour
-// of migrate.sh's copy_apps.
+// job per local .app that is not already present.
 func appJobs(ctx context.Context, opt Options) ([]Job, []string, error) {
-	existing, err := opt.SSH.remoteList(ctx, opt.Dest, applicationsDir)
+	existing, err := opt.SSH.remoteList(ctx, opt.Dest, opt.remoteAppsDir())
 	if err != nil {
-		return nil, nil, fmt.Errorf("listing %s on %s: %w", applicationsDir, opt.Dest, err)
+		return nil, nil, fmt.Errorf("listing %s on %s: %w", opt.remoteAppsDir(), opt.Dest, err)
 	}
 	if opt.Debug {
 		names := make([]string, 0, len(existing))
@@ -291,9 +334,9 @@ func appJobs(ctx context.Context, opt Options) ([]Job, []string, error) {
 		}
 		sort.Strings(names)
 		Debugf(true, "apps: remote %s on %s has %d entries: %s",
-			applicationsDir, opt.Dest, len(names), strings.Join(names, ", "))
+			opt.remoteAppsDir(), opt.Dest, len(names), strings.Join(names, ", "))
 	}
-	entries, err := os.ReadDir(applicationsDir)
+	entries, err := os.ReadDir(opt.appsDir())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -315,15 +358,15 @@ func appJobs(ctx context.Context, opt Options) ([]Job, []string, error) {
 		Debugf(opt.Debug, "apps: will copy: %s", name)
 		jobs = append(jobs, Job{
 			Label:       "App/" + strings.TrimSuffix(name, ".app"),
-			Srcs:        []string{filepath.Join(applicationsDir, name)}, // no trailing slash: copy the bundle itself
-			Dst:         opt.Dest + ":" + applicationsDir + "/",
+			Srcs:        []string{filepath.Join(opt.appsDir(), name)}, // no trailing slash: copy the bundle itself
+			Dst:         opt.Dest + ":" + ensureSlash(opt.remoteAppsDir()),
 			Excludes:    opt.RsyncExclude,
 			RemoteShell: opt.SSH.RsyncRemoteShell(),
-			Chown:       chownFor(opt, applicationsDir+"/"+name, true), // scoped to the copied bundle
+			Chown:       chownFor(opt, opt.remoteAppsDir()+"/"+name, true), // scoped to the copied bundle
 		})
 	}
 	Debugf(opt.Debug, "apps: local %s has %d entries (%d non-.app ignored): %d to copy, %d skipped",
-		applicationsDir, len(entries), ignored, len(jobs), len(notes))
+		opt.appsDir(), len(entries), ignored, len(jobs), len(notes))
 	sortJobs(jobs)
 	return jobs, notes, nil
 }
