@@ -93,17 +93,20 @@ macmigrate cleanup <dest>   # undo setup on the destination
 
 Provisions the destination so `sync` runs unattended. It:
 
-1. **Reuses an existing SSH key** in `~/.ssh` (`id_ed25519`, `id_rsa`, …) if one
-   is present, otherwise **generates `~/.ssh/id_macmigrate`** (a distinct name so
-   `sync` and `cleanup` can recognise it). Pass `-i <path>` to choose a key, or
-   `--skip-keygen` to require an existing one rather than generating.
+1. **Reuses an existing SSH key** — a previously generated `~/.ssh/id_macmigrate`
+   first, then a standard key (`id_ed25519`, `id_rsa`, …) — otherwise
+   **generates `~/.ssh/id_macmigrate`** (a distinct name so `sync` and `cleanup`
+   can recognise it). Pass `-i <path>` to choose a key, or `--skip-keygen` to
+   require an existing one rather than generating.
 2. **Installs the public key** in the destination's `authorized_keys` (creating
    `~/.ssh` with 700 / the file with 600).
 3. **Grants passwordless sudo** to the destination login user via
    `/etc/sudoers.d/macmigrate` (validated with `visudo -cf`).
 
-The first connection authenticates with a password, so expect one prompt (and a
-sudo prompt for step 3). `setup` is idempotent — re-running it is safe.
+Steps 2 and 3 run in a **single ssh session with a single password prompt**:
+the destination password is read once up front and feeds both the ssh
+authentication and the remote `sudo`. `setup` is idempotent — re-running it is
+safe, and prompt-free when everything is already configured.
 
 ### `cleanup <dest>`
 

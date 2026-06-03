@@ -39,10 +39,10 @@ func fileExists(path string) bool {
 	return err == nil && !fi.IsDir()
 }
 
-// resolveSyncIdentity picks the identity sync/cleanup should connect with: an
-// explicit -i wins; otherwise the macmigrate-generated key is used when present
-// (ssh won't try it on its own — it's not a standard name); otherwise "" leaves
-// ssh to its default key selection (the user's own id_ed25519 etc. or agent).
+// resolveSyncIdentity picks the identity sync should connect with: an explicit
+// -i wins; otherwise the macmigrate-generated key is used when present (ssh
+// won't try it on its own — it's not a standard name); otherwise "" leaves ssh
+// to its default key selection (the user's own id_ed25519 etc. or agent).
 func resolveSyncIdentity(home, identityFlag string) (string, error) {
 	if identityFlag != "" {
 		if !fileExists(identityFlag) {
@@ -56,20 +56,37 @@ func resolveSyncIdentity(home, identityFlag string) (string, error) {
 	return "", nil
 }
 
-// resolveSetupIdentity decides which key setup installs: an explicit -i, else an
-// existing standard keypair, else (unless skipKeygen) a freshly generated
-// macmigrate key. generated reports whether the returned path was just created.
-func resolveSetupIdentity(home, identityFlag string, skipKeygen bool) (path string, generated bool, err error) {
+// findExistingIdentity is the shared resolution order for setup and cleanup: an
+// explicit -i, else a previously generated macmigrate key, else the first
+// standard keypair. The macmigrate key outranks standard keys so that setup,
+// sync and cleanup all agree on the same key when a generated one is lying
+// around — sync auto-selects it, so setup must install that one, and cleanup
+// must remove it. "" means none found.
+func findExistingIdentity(home, identityFlag string) (string, error) {
 	if identityFlag != "" {
 		if !keypairExists(identityFlag) {
-			return "", false, fmt.Errorf("identity %q (or its .pub) does not exist", identityFlag)
+			return "", fmt.Errorf("identity %q (or its .pub) does not exist", identityFlag)
 		}
-		return identityFlag, false, nil
+		return identityFlag, nil
+	}
+	if p := macmigrateKeyPath(home); keypairExists(p) {
+		return p, nil
 	}
 	for _, name := range standardKeyNames {
 		if p := filepath.Join(sshDir(home), name); keypairExists(p) {
-			return p, false, nil
+			return p, nil
 		}
+	}
+	return "", nil
+}
+
+// resolveSetupIdentity decides which key setup installs: an existing key per
+// findExistingIdentity, else (unless skipKeygen) a freshly generated macmigrate
+// key. Re-runs find the previously generated key instead of invoking ssh-keygen
+// over it. generated reports whether the returned path was just created.
+func resolveSetupIdentity(home, identityFlag string, skipKeygen bool) (path string, generated bool, err error) {
+	if p, err := findExistingIdentity(home, identityFlag); err != nil || p != "" {
+		return p, false, err
 	}
 	if skipKeygen {
 		return "", false, fmt.Errorf("no SSH key found in %s and --skip-keygen is set; "+

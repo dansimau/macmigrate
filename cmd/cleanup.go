@@ -27,7 +27,7 @@ var cleanupCmd = &cobra.Command{
 
 func init() {
 	cleanupCmd.Flags().StringVarP(&cleanupIdentity, "identity", "i", "",
-		"the key installed by setup (defaults to ~/.ssh/"+macmigrateKeyName+")")
+		"the key installed by setup (defaults to ~/.ssh/"+macmigrateKeyName+", else an existing standard key)")
 	rootCmd.AddCommand(cleanupCmd)
 }
 
@@ -36,7 +36,9 @@ func runCleanup(ctx context.Context, dest string) error {
 	if err != nil {
 		return fail("locating your home directory: %v", err)
 	}
-	identity, err := resolveSyncIdentity(home, cleanupIdentity)
+	// Resolve with the same order as setup (macmigrate key, then standard keys)
+	// so cleanup removes whichever key setup actually installed.
+	identity, err := findExistingIdentity(home, cleanupIdentity)
 	if err != nil {
 		return fail("%v", err)
 	}
@@ -54,7 +56,7 @@ func runCleanup(ctx context.Context, dest string) error {
 	}
 
 	if identity == "" {
-		fmt.Println("Skipping authorized_keys cleanup: no macmigrate key found and no -i given.")
+		fmt.Println("Skipping authorized_keys cleanup: no local SSH key found and no -i given.")
 		fmt.Println("  Pass -i <key> to remove a specific public key from the destination.")
 	} else if _, body, err := readPubKey(identity); err != nil {
 		fmt.Fprintf(os.Stderr, "  ⚠ could not read %s.pub: %v\n", identity, err)

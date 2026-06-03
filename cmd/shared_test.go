@@ -71,6 +71,30 @@ func TestResolveSetupIdentity(t *testing.T) {
 		}
 	})
 
+	t.Run("reuses a previously generated macmigrate key without regenerating", func(t *testing.T) {
+		home := t.TempDir()
+		want := writeKeypair(t, home, macmigrateKeyName, "AAAAmm")
+		got, generated, err := resolveSetupIdentity(home, "", false)
+		if err != nil || generated || got != want {
+			t.Fatalf("got (%q, gen=%v, %v), want (%q, gen=false, nil)", got, generated, err, want)
+		}
+	})
+
+	t.Run("prefers the macmigrate key over standard keys (matches sync)", func(t *testing.T) {
+		home := t.TempDir()
+		writeKeypair(t, home, "id_ed25519", "AAAAstd")
+		want := writeKeypair(t, home, macmigrateKeyName, "AAAAmm")
+		got, _, err := resolveSetupIdentity(home, "", false)
+		if err != nil || got != want {
+			t.Fatalf("got (%q, %v), want (%q, nil)", got, err, want)
+		}
+		// sync must pick the same key setup installed.
+		syncGot, err := resolveSyncIdentity(home, "")
+		if err != nil || syncGot != want {
+			t.Fatalf("sync got (%q, %v), want (%q, nil)", syncGot, err, want)
+		}
+	})
+
 	t.Run("skip-keygen with no key errors", func(t *testing.T) {
 		home := t.TempDir()
 		if _, _, err := resolveSetupIdentity(home, "", true); err == nil {
@@ -108,6 +132,28 @@ func TestResolveSetupIdentity(t *testing.T) {
 		}
 		if !keypairExists(got) {
 			t.Fatalf("generated keypair missing at %s", got)
+		}
+	})
+}
+
+// TestFindExistingIdentity covers cleanup's resolution: it must find whichever
+// key setup would have installed, including a standard key when no macmigrate
+// key exists — otherwise cleanup wouldn't actually reverse setup.
+func TestFindExistingIdentity(t *testing.T) {
+	t.Run("falls back to a standard key", func(t *testing.T) {
+		home := t.TempDir()
+		want := writeKeypair(t, home, "id_ed25519", "AAAAstd")
+		got, err := findExistingIdentity(home, "")
+		if err != nil || got != want {
+			t.Fatalf("got (%q, %v), want (%q, nil)", got, err, want)
+		}
+	})
+
+	t.Run("none found returns empty", func(t *testing.T) {
+		home := t.TempDir()
+		got, err := findExistingIdentity(home, "")
+		if err != nil || got != "" {
+			t.Fatalf("got (%q, %v), want (\"\", nil)", got, err)
 		}
 	})
 }

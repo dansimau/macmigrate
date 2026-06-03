@@ -8,6 +8,7 @@ import (
 	"github.com/dansimau/macmigrate/internal/migrate"
 	"github.com/dansimau/macmigrate/internal/xexec"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 var (
@@ -22,7 +23,9 @@ var setupCmd = &cobra.Command{
 		"  1. Uses an existing SSH key (or generates ~/.ssh/" + macmigrateKeyName + ").\n" +
 		"  2. Installs the public key in the destination's authorized_keys.\n" +
 		"  3. Grants the destination login user passwordless sudo (" + migrate.SudoersPath + ").\n\n" +
-		"It connects with a password the first time, so expect to be prompted.",
+		"Steps 2 and 3 happen in a single ssh session: the destination password is\n" +
+		"asked for once, up front. Re-running setup is safe (and prompt-free when\n" +
+		"there is nothing left to do).",
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runSetup(cmd.Context(), args[0])
@@ -58,26 +61,34 @@ func runSetup(ctx context.Context, dest string) error {
 		return fail("%v", err)
 	}
 
-	// 1. Install the public key. This first connection authenticates with a
-	// password (no -i: the key isn't authorized yet), so it must be interactive.
-	fmt.Printf("Installing the public key on %s (you may be prompted for the destination password) …\n", dest)
-	if err := migrate.InstallAuthorizedKey(ctx, migrate.SSH{TTY: true}, dest, pubLine); err != nil {
-		return fail("installing the public key on %s: %v", dest, err)
+	// Idempotent fast path: if the key is already authorized and sudo is already
+	// passwordless, there is nothing to do — and nothing to prompt for. A key
+	// generated moments ago can't be authorized yet, so skip the probe.
+	keySSH := migrate.SSH{Identity: identity, BatchMode: true}
+	if !generated && migrate.VerifyKey(ctx, keySSH, dest) == nil && keySSH.CanSudo(ctx, dest) {
+		fmt.Printf("✓ Already set up: key auth and passwordless sudo both work on %s\n", dest)
+		return nil
 	}
 
-	// 2. Confirm key-only auth now works before relying on it.
-	if err := migrate.VerifyKey(ctx, migrate.SSH{Identity: identity, BatchMode: true}, dest); err != nil {
+	// One password, one session: ssh auth (if the key isn't authorized yet) and
+	// the remote sudo both consume the password read here — see migrate.Provision.
+	fmt.Fprintf(os.Stderr, "Password for %s (asked once; used for ssh and sudo): ", dest)
+	pw, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Fprintln(os.Stderr)
+	if err != nil {
+		return fail("reading password (setup needs an interactive terminal): %v", err)
+	}
+
+	fmt.Printf("Installing the public key and passwordless sudo on %s …\n", dest)
+	if err := migrate.Provision(ctx, migrate.SSH{Identity: identity}, dest, pubLine, string(pw)); err != nil {
+		return fail("%v", err)
+	}
+
+	// Verify both halves with non-interactive connections before declaring success.
+	if err := migrate.VerifyKey(ctx, keySSH, dest); err != nil {
 		return fail("%v", err)
 	}
 	fmt.Println("✓ Key-based ssh works")
-
-	// 3. Grant passwordless sudo. The connection is key-based now, but sudo
-	// itself still prompts the first time, so keep it interactive.
-	fmt.Printf("Configuring passwordless sudo on %s (you may be prompted for the destination sudo password) …\n", dest)
-	if err := migrate.InstallSudoers(ctx, migrate.SSH{Identity: identity, TTY: true}, dest); err != nil {
-		return fail("configuring passwordless sudo on %s: %v", dest, err)
-	}
-	keySSH := migrate.SSH{Identity: identity}
 	if !keySSH.CanSudo(ctx, dest) {
 		return fail("passwordless sudo still isn't working on %s after writing %s", dest, migrate.SudoersPath)
 	}

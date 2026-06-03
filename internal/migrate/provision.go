@@ -3,8 +3,12 @@ package migrate
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"al.essio.dev/pkg/shellescape"
+	"github.com/dansimau/macmigrate/internal/xexec"
 )
 
 // SudoersPath is the drop-in file setup writes (and cleanup removes) to grant
@@ -16,22 +20,97 @@ const SudoersPath = "/etc/sudoers.d/macmigrate"
 // remote login shell ($HOME, not ~, so it also resolves under sudo-free ssh).
 const authorizedKeysPath = "$HOME/.ssh/authorized_keys"
 
-// InstallAuthorizedKey appends pubKey to the destination user's authorized_keys,
-// creating ~/.ssh with the right modes first. This is the bootstrap step, so it
-// runs over a password-authenticated, interactive connection (set s.TTY).
-func InstallAuthorizedKey(ctx context.Context, s SSH, dest, pubKey string) error {
-	return s.Run(ctx, dest, installAuthorizedKeyCmd(pubKey))
+// Provision installs pubKey in the destination's authorized_keys and writes the
+// passwordless-sudo drop-in, all in a single ssh session so the destination
+// password is needed exactly once: ssh authentication (when the key isn't
+// authorized yet) reads it through an SSH_ASKPASS helper, and the remote
+// `sudo -S` reads the same password from the piped stdin. s should carry the
+// identity being installed — if it's already authorized, ssh uses it and the
+// password only feeds sudo.
+func Provision(ctx context.Context, s SSH, dest, pubKey, password string) error {
+	argv := append(s.prefix(),
+		// Host-key confirmation can't be answered interactively here (askpass
+		// would feed it the password), so accept unseen hosts; changed keys
+		// still hard-fail. A wrong password should fail fast, not retry.
+		"-o", "StrictHostKeyChecking=accept-new",
+		"-o", "NumberOfPasswordPrompts=1",
+		dest, provisionCmd(pubKey))
+	cmd := xexec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Stdin = strings.NewReader(password + "\n")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	askpass, cleanup, err := askpassScript()
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	env := append(os.Environ(),
+		"SSH_ASKPASS="+askpass,
+		"SSH_ASKPASS_REQUIRE=force",
+		"MACMIGRATE_ASKPASS="+password,
+	)
+	if os.Getenv("DISPLAY") == "" {
+		env = append(env, "DISPLAY=:0") // pre-8.4 ssh only consults askpass when DISPLAY is set
+	}
+	cmd.Env = env
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("provisioning %s: %w", dest, err)
+	}
+	return nil
 }
 
-// installAuthorizedKeyCmd builds the idempotent remote command: ensure ~/.ssh
-// (700) and authorized_keys (600) exist, then append the key only if an
-// identical line isn't already present (grep -qxF), so re-running setup is safe.
+// askpassScript writes a throwaway SSH_ASKPASS helper that prints the password
+// ssh asks for. The password itself stays out of the script (and off disk) —
+// the helper reads it from the environment Provision sets on the ssh process.
+func askpassScript() (path string, cleanup func(), err error) {
+	dir, err := os.MkdirTemp("", "macmigrate-askpass")
+	if err != nil {
+		return "", nil, fmt.Errorf("creating askpass helper: %w", err)
+	}
+	path = filepath.Join(dir, "askpass.sh")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$MACMIGRATE_ASKPASS\"\n"
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		os.RemoveAll(dir)
+		return "", nil, fmt.Errorf("creating askpass helper: %w", err)
+	}
+	return path, func() { os.RemoveAll(dir) }, nil
+}
+
+// provisionCmd chains the key install and the sudoers install into one remote
+// command, so both happen in the single password-authenticated session.
+func provisionCmd(pubKey string) string {
+	return installAuthorizedKeyCmd(pubKey) + " && " + installSudoersCmd()
+}
+
+// installAuthorizedKeyCmd builds the idempotent key-install command: ensure
+// ~/.ssh (700) and authorized_keys (600) exist and that the file ends in a
+// newline (an unterminated last line would swallow the appended key into the
+// previous entry's comment), then append the key only if an identical line
+// isn't already present (grep -qxF), so re-running setup is safe.
 func installAuthorizedKeyCmd(pubKey string) string {
 	q := shellescape.Quote(pubKey)
+	f := authorizedKeysPath
 	return "mkdir -p ~/.ssh && chmod 700 ~/.ssh" +
-		" && touch " + authorizedKeysPath + " && chmod 600 " + authorizedKeysPath +
-		" && { grep -qxF " + q + " " + authorizedKeysPath +
-		" || printf '%s\\n' " + q + " >> " + authorizedKeysPath + "; }"
+		" && touch " + f + " && chmod 600 " + f +
+		" && { [ ! -s " + f + ` ] || [ -z "$(tail -c1 ` + f + `)" ] || echo >> ` + f + "; }" +
+		" && { grep -qxF " + q + " " + f +
+		" || printf '%s\\n' " + q + " >> " + f + "; }"
+}
+
+// installSudoersCmd grants the destination login user passwordless sudo via a
+// validated drop-in. `id -un` is expanded by the remote login shell (the user,
+// not root) and handed to the elevated sh as $1. sudo runs with -S so it reads
+// the password from the session's stdin — the same one the user already
+// supplied — instead of prompting on the tty. visudo -cf rejects a malformed
+// file, which is removed rather than left breaking sudo.
+func installSudoersCmd() string {
+	return `sudo -S -p '' /bin/sh -c ` +
+		`'printf "%s ALL=(ALL) NOPASSWD: ALL\n" "$1" > ` + SudoersPath +
+		` && chmod 440 ` + SudoersPath +
+		` && visudo -cf ` + SudoersPath +
+		` || { rm -f ` + SudoersPath + `; exit 1; }' sh "$(id -un)"`
 }
 
 // VerifyKey confirms the destination accepts key-only auth, failing fast instead
@@ -42,22 +121,6 @@ func VerifyKey(ctx context.Context, s SSH, dest string) error {
 		return fmt.Errorf("key-based ssh to %s did not work: %w", dest, err)
 	}
 	return nil
-}
-
-// InstallSudoers grants the destination login user passwordless sudo via a
-// validated drop-in. `id -un` is expanded by the remote shell, so the rule names
-// that machine's login user. sudo still prompts the first time, so this runs
-// interactively (set s.TTY). visudo -cf rejects a malformed file rather than
-// leaving a broken sudoers in place.
-func InstallSudoers(ctx context.Context, s SSH, dest string) error {
-	return s.Run(ctx, dest, installSudoersCmd())
-}
-
-func installSudoersCmd() string {
-	p := shellescape.Quote(SudoersPath)
-	return `echo "$(id -un) ALL=(ALL) NOPASSWD: ALL" | sudo tee ` + p + " >/dev/null" +
-		" && sudo chmod 440 " + p +
-		" && sudo visudo -cf " + p
 }
 
 // RemoveSudoers deletes the sudoers drop-in. It may need a password if
