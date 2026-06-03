@@ -32,14 +32,12 @@ func TestInstallAuthorizedKeyCmd(t *testing.T) {
 func TestInstallSudoersCmd(t *testing.T) {
 	got := installSudoersCmd()
 	for _, want := range []string{
-		// -S: the password comes from the session's stdin, not a tty prompt.
-		`sudo -S -p '' /bin/sh -c`,
-		// The login shell (the user, not root) resolves the username into $1.
-		`'printf "%s ALL=(ALL) NOPASSWD: ALL\n" "$1" > /etc/sudoers.d/macmigrate`,
-		"chmod 440 /etc/sudoers.d/macmigrate",
-		"visudo -cf /etc/sudoers.d/macmigrate",
+		// `id -un` is expanded by the remote login shell (the user, not root).
+		`echo "$(id -un) ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/macmigrate >/dev/null`,
+		"sudo chmod 440 /etc/sudoers.d/macmigrate",
+		"sudo visudo -cf /etc/sudoers.d/macmigrate",
 		// A malformed file is removed, not left breaking sudo.
-		`|| { rm -f /etc/sudoers.d/macmigrate; exit 1; }' sh "$(id -un)"`,
+		"|| { sudo rm -f /etc/sudoers.d/macmigrate; exit 1; }",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("installSudoersCmd missing %q\ngot: %s", want, got)
@@ -47,9 +45,9 @@ func TestInstallSudoersCmd(t *testing.T) {
 	}
 }
 
-// TestProvisionCmdSingleSession guards the one-password contract: the key
-// install and the sudoers install run chained in a single remote command, so
-// one ssh session (and one password) covers both.
+// TestProvisionCmdSingleSession guards the one-session contract: the key
+// install and the sudoers install run chained in a single remote command over
+// the master connection, so the user authenticates to ssh only once.
 func TestProvisionCmdSingleSession(t *testing.T) {
 	pub := "ssh-ed25519 AAAAbody macmigrate@host"
 	got := provisionCmd(pub)

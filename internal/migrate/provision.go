@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
+	"time"
 
 	"al.essio.dev/pkg/shellescape"
 	"github.com/dansimau/macmigrate/internal/xexec"
@@ -20,66 +20,95 @@ const SudoersPath = "/etc/sudoers.d/macmigrate"
 // remote login shell ($HOME, not ~, so it also resolves under sudo-free ssh).
 const authorizedKeysPath = "$HOME/.ssh/authorized_keys"
 
-// Provision installs pubKey in the destination's authorized_keys and writes the
-// passwordless-sudo drop-in, all in a single ssh session so the destination
-// password is needed exactly once: ssh authentication (when the key isn't
-// authorized yet) reads it through an SSH_ASKPASS helper, and the remote
-// `sudo -S` reads the same password from the piped stdin. s should carry the
-// identity being installed — if it's already authorized, ssh uses it and the
-// password only feeds sudo.
-func Provision(ctx context.Context, s SSH, dest, pubKey, password string) error {
-	argv := append(s.prefix(),
-		// Host-key confirmation can't be answered interactively here (askpass
-		// would feed it the password), so accept unseen hosts; changed keys
-		// still hard-fail. A wrong password should fail fast, not retry.
-		"-o", "StrictHostKeyChecking=accept-new",
-		"-o", "NumberOfPasswordPrompts=1",
-		dest, provisionCmd(pubKey))
+// MasterSession is an ssh ControlMaster connection that setup's commands
+// multiplex over, so the user authenticates exactly once for the whole
+// provisioning phase. ssh owns all prompting (password, host key) directly on
+// the terminal — the password never passes through this process. Setup-only:
+// sync and cleanup open ordinary connections.
+type MasterSession struct {
+	sock string
+	dir  string
+	dest string
+	done chan error
+}
+
+// OpenMaster starts an interactive master connection to dest (authenticating as
+// needed on the caller's terminal) and waits until its control socket accepts
+// multiplexed sessions. Close it when the provisioning phase is over.
+func OpenMaster(ctx context.Context, s SSH, dest string) (*MasterSession, error) {
+	dir, err := os.MkdirTemp("", "macmigrate-ssh")
+	if err != nil {
+		return nil, fmt.Errorf("creating control-socket directory: %w", err)
+	}
+	sock := filepath.Join(dir, "ctl")
+
+	s.ControlPath = sock
+	argv := append(s.prefix(), "-M", "-N", dest)
 	cmd := xexec.CommandContext(ctx, argv[0], argv[1:]...)
-	cmd.Stdin = strings.NewReader(password + "\n")
+	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-
-	askpass, cleanup, err := askpassScript()
-	if err != nil {
-		return err
+	if err := cmd.Start(); err != nil {
+		os.RemoveAll(dir)
+		return nil, fmt.Errorf("starting ssh master to %s: %w", dest, err)
 	}
-	defer cleanup()
-	env := append(os.Environ(),
-		"SSH_ASKPASS="+askpass,
-		"SSH_ASKPASS_REQUIRE=force",
-		"MACMIGRATE_ASKPASS="+password,
-	)
-	if os.Getenv("DISPLAY") == "" {
-		env = append(env, "DISPLAY=:0") // pre-8.4 ssh only consults askpass when DISPLAY is set
-	}
-	cmd.Env = env
+	m := &MasterSession{sock: sock, dir: dir, dest: dest, done: make(chan error, 1)}
+	go func() { m.done <- cmd.Wait() }()
 
-	if err := cmd.Run(); err != nil {
+	// The master is ready when -O check succeeds. No fixed deadline: the user
+	// may be typing a password; a failed/cancelled master ends the wait instead.
+	for {
+		select {
+		case err := <-m.done:
+			os.RemoveAll(dir)
+			if err == nil {
+				err = fmt.Errorf("connection closed")
+			}
+			return nil, fmt.Errorf("ssh master to %s exited before it was ready: %w", dest, err)
+		case <-ctx.Done():
+			os.RemoveAll(dir)
+			return nil, ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+			if m.check(ctx) {
+				return m, nil
+			}
+		}
+	}
+}
+
+// check reports whether the control socket is accepting connections.
+func (m *MasterSession) check(ctx context.Context) bool {
+	cmd := xexec.CommandContext(ctx, "ssh", "-o", "ControlPath="+m.sock, "-O", "check", m.dest)
+	cmd.Stdout, cmd.Stderr = nil, nil
+	return cmd.Run() == nil
+}
+
+// SSH returns the connection settings that reuse this master: commands run with
+// it attach to the already-authenticated session and never prompt for auth.
+func (m *MasterSession) SSH() SSH { return SSH{ControlPath: m.sock} }
+
+// Close shuts the master down and removes the control socket.
+func (m *MasterSession) Close() {
+	cmd := xexec.Command("ssh", "-o", "ControlPath="+m.sock, "-O", "exit", m.dest)
+	cmd.Stdout, cmd.Stderr = nil, nil
+	_ = cmd.Run()
+	<-m.done
+	os.RemoveAll(m.dir)
+}
+
+// Provision installs pubKey in the destination's authorized_keys and writes the
+// passwordless-sudo drop-in as one remote command. Run it over a MasterSession
+// connection with TTY set: the session is already authenticated, and the pty
+// lets the remote sudo prompt for its password on the user's terminal.
+func Provision(ctx context.Context, s SSH, dest, pubKey string) error {
+	if err := s.Run(ctx, dest, provisionCmd(pubKey)); err != nil {
 		return fmt.Errorf("provisioning %s: %w", dest, err)
 	}
 	return nil
 }
 
-// askpassScript writes a throwaway SSH_ASKPASS helper that prints the password
-// ssh asks for. The password itself stays out of the script (and off disk) —
-// the helper reads it from the environment Provision sets on the ssh process.
-func askpassScript() (path string, cleanup func(), err error) {
-	dir, err := os.MkdirTemp("", "macmigrate-askpass")
-	if err != nil {
-		return "", nil, fmt.Errorf("creating askpass helper: %w", err)
-	}
-	path = filepath.Join(dir, "askpass.sh")
-	script := "#!/bin/sh\nprintf '%s\\n' \"$MACMIGRATE_ASKPASS\"\n"
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
-		os.RemoveAll(dir)
-		return "", nil, fmt.Errorf("creating askpass helper: %w", err)
-	}
-	return path, func() { os.RemoveAll(dir) }, nil
-}
-
 // provisionCmd chains the key install and the sudoers install into one remote
-// command, so both happen in the single password-authenticated session.
+// command, so both happen in the single authenticated session.
 func provisionCmd(pubKey string) string {
 	return installAuthorizedKeyCmd(pubKey) + " && " + installSudoersCmd()
 }
@@ -100,22 +129,21 @@ func installAuthorizedKeyCmd(pubKey string) string {
 }
 
 // installSudoersCmd grants the destination login user passwordless sudo via a
-// validated drop-in. `id -un` is expanded by the remote login shell (the user,
-// not root) and handed to the elevated sh as $1. sudo runs with -S so it reads
-// the password from the session's stdin — the same one the user already
-// supplied — instead of prompting on the tty. visudo -cf rejects a malformed
-// file, which is removed rather than left breaking sudo.
+// validated drop-in. `id -un` is expanded by the remote shell, so the rule
+// names that machine's login user. sudo prompts on the session's pty if it
+// needs a password; its timestamp then covers the follow-up commands. visudo
+// -cf rejects a malformed file, which is removed rather than left breaking sudo.
 func installSudoersCmd() string {
-	return `sudo -S -p '' /bin/sh -c ` +
-		`'printf "%s ALL=(ALL) NOPASSWD: ALL\n" "$1" > ` + SudoersPath +
-		` && chmod 440 ` + SudoersPath +
-		` && visudo -cf ` + SudoersPath +
-		` || { rm -f ` + SudoersPath + `; exit 1; }' sh "$(id -un)"`
+	p := SudoersPath
+	return `echo "$(id -un) ALL=(ALL) NOPASSWD: ALL" | sudo tee ` + p + " >/dev/null" +
+		" && sudo chmod 440 " + p +
+		" && { sudo visudo -cf " + p + " || { sudo rm -f " + p + "; exit 1; }; }"
 }
 
 // VerifyKey confirms the destination accepts key-only auth, failing fast instead
 // of letting a misconfigured key fall through to a password prompt mid-migration.
-// The caller passes an SSH value carrying the identity and BatchMode=yes.
+// The caller passes an SSH value carrying the identity and BatchMode=yes — and
+// no ControlPath, so it genuinely re-authenticates rather than riding the master.
 func VerifyKey(ctx context.Context, s SSH, dest string) error {
 	if _, err := s.Capture(ctx, dest, "true"); err != nil {
 		return fmt.Errorf("key-based ssh to %s did not work: %w", dest, err)

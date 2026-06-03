@@ -8,7 +8,6 @@ import (
 	"github.com/dansimau/macmigrate/internal/migrate"
 	"github.com/dansimau/macmigrate/internal/xexec"
 	"github.com/spf13/cobra"
-	"golang.org/x/term"
 )
 
 var (
@@ -23,9 +22,9 @@ var setupCmd = &cobra.Command{
 		"  1. Uses an existing SSH key (or generates ~/.ssh/" + macmigrateKeyName + ").\n" +
 		"  2. Installs the public key in the destination's authorized_keys.\n" +
 		"  3. Grants the destination login user passwordless sudo (" + migrate.SudoersPath + ").\n\n" +
-		"Steps 2 and 3 happen in a single ssh session: the destination password is\n" +
-		"asked for once, up front. Re-running setup is safe (and prompt-free when\n" +
-		"there is nothing left to do).",
+		"Steps 2 and 3 share a single ssh session (ControlMaster), so you authenticate\n" +
+		"to ssh once; the remote sudo may additionally ask for its password. Re-running\n" +
+		"setup is safe (and prompt-free when there is nothing left to do).",
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runSetup(cmd.Context(), args[0])
@@ -70,21 +69,27 @@ func runSetup(ctx context.Context, dest string) error {
 		return nil
 	}
 
-	// One password, one session: ssh auth (if the key isn't authorized yet) and
-	// the remote sudo both consume the password read here — see migrate.Provision.
-	fmt.Fprintf(os.Stderr, "Password for %s (asked once; used for ssh and sudo): ", dest)
-	pw, err := term.ReadPassword(int(os.Stdin.Fd()))
-	fmt.Fprintln(os.Stderr)
+	// One master connection for the whole provisioning phase: ssh authenticates
+	// once (prompting on this terminal as needed) and the commands below
+	// multiplex over it. The key is offered first, so a re-run where it is
+	// already authorized connects without any ssh prompt.
+	fmt.Printf("Connecting to %s …\n", dest)
+	master, err := migrate.OpenMaster(ctx, migrate.SSH{Identity: identity}, dest)
 	if err != nil {
-		return fail("reading password (setup needs an interactive terminal): %v", err)
+		return fail("%v", err)
 	}
+	defer master.Close()
 
+	// TTY so the remote sudo can prompt for its password on this terminal.
+	mux := master.SSH()
+	mux.TTY = true
 	fmt.Printf("Installing the public key and passwordless sudo on %s …\n", dest)
-	if err := migrate.Provision(ctx, migrate.SSH{Identity: identity}, dest, pubLine, string(pw)); err != nil {
+	if err := migrate.Provision(ctx, mux, dest, pubLine); err != nil {
 		return fail("%v", err)
 	}
 
-	// Verify both halves with non-interactive connections before declaring success.
+	// Verify both halves with fresh non-interactive connections (deliberately
+	// not over the master, which would succeed regardless of the key).
 	if err := migrate.VerifyKey(ctx, keySSH, dest); err != nil {
 		return fail("%v", err)
 	}

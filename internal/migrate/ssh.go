@@ -16,10 +16,11 @@ import (
 // it uses that user's ssh-agent, keys and known_hosts (root has none of these) —
 // hence User, which launches ssh via `sudo -E -u <User> ssh`.
 type SSH struct {
-	User      string // run ssh as this local user via `sudo -E -u`; "" => plain ssh
-	Identity  string // -i <path> (+ IdentitiesOnly); "" => ssh's default key selection
-	TTY       bool   // -t: allocate a pty so remote sudo/password prompts work
-	BatchMode bool   // -o BatchMode=yes: never prompt, fail instead (key-only checks)
+	User        string // run ssh as this local user via `sudo -E -u`; "" => plain ssh
+	Identity    string // -i <path> (+ IdentitiesOnly); "" => ssh's default key selection
+	TTY         bool   // -t: allocate a pty so remote sudo/password prompts work
+	BatchMode   bool   // -o BatchMode=yes: never prompt, fail instead (key-only checks)
+	ControlPath string // -o ControlPath=<sock>: multiplex over a MasterSession (setup only)
 }
 
 // prefix returns the local argv that launches ssh, up to but not including the
@@ -40,6 +41,9 @@ func (s SSH) prefix() []string {
 	}
 	if s.BatchMode {
 		argv = append(argv, "-o", "BatchMode=yes")
+	}
+	if s.ControlPath != "" {
+		argv = append(argv, "-o", "ControlPath="+s.ControlPath)
 	}
 	if s.TTY {
 		argv = append(argv, "-t")

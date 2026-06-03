@@ -15,6 +15,8 @@ func TestSSHPrefix(t *testing.T) {
 		{"as user", SSH{User: "alice"}, []string{"sudo", "-E", "-u", "alice", "ssh"}},
 		{"identity", SSH{Identity: "/k"}, []string{"ssh", "-i", "/k", "-o", "IdentitiesOnly=yes"}},
 		{"batch", SSH{Identity: "/k", BatchMode: true}, []string{"ssh", "-i", "/k", "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes"}},
+		{"control path", SSH{ControlPath: "/tmp/ctl", TTY: true},
+			[]string{"ssh", "-o", "ControlPath=/tmp/ctl", "-t"}},
 		{"tty as user with identity", SSH{User: "bob", Identity: "/k", TTY: true},
 			[]string{"sudo", "-E", "-u", "bob", "ssh", "-i", "/k", "-o", "IdentitiesOnly=yes", "-t"}},
 	}
