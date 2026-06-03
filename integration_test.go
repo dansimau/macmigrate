@@ -34,13 +34,16 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/dansimau/macmigrate/internal/migrate"
 )
 
 const (
-	testUser    = "macmigratetest"
-	testHome    = "/Users/" + testUser
-	sudoersPath = "/etc/sudoers.d/macmigrate-test"
-	fixturesDir = "test/fixtures"
+	testUser       = "macmigratetest"
+	testHome       = "/Users/" + testUser
+	sudoersPath    = "/etc/sudoers.d/macmigrate-test"
+	fixturesDir    = "test/fixtures"
+	harnessKeyName = "harness_key" // non-standard on purpose; see provisionTestUser
 )
 
 var (
@@ -60,6 +63,7 @@ func TestMain(m *testing.M) {
 	if os.Getenv("MACMIGRATE_TEST_CLEANUP") == "1" && os.Geteuid() == 0 {
 		exec.Command("sysadminctl", "-deleteUser", testUser).Run()
 		os.Remove(sudoersPath)
+		os.Remove(migrate.SudoersPath) // in case a setup test failed mid-way
 	}
 	os.Exit(code)
 }
@@ -91,8 +95,16 @@ func buildBinary() error {
 	if err != nil {
 		return err
 	}
+	// The setup/cleanup tests execute the binary as the (unprivileged) test
+	// user, so the root-owned temp dir and binary must be world-readable.
+	if err := os.Chmod(binDir, 0o755); err != nil {
+		return err
+	}
 	binPath = filepath.Join(binDir, "macmigrate")
-	return runCmd(goBin, "build", "-o", binPath, ".")
+	if err := runCmd(goBin, "build", "-o", binPath, "."); err != nil {
+		return err
+	}
+	return os.Chmod(binPath, 0o755)
 }
 
 // provisionTestUser creates the macmigratetest user (if missing) and equips it
@@ -135,7 +147,14 @@ func provisionTestUser() error {
 	if err := os.MkdirAll(sshDir, 0o700); err != nil {
 		return err
 	}
-	key := filepath.Join(sshDir, "id_ed25519")
+	// The harness key deliberately has a NON-standard name: `setup` reuses any
+	// standard key (id_ed25519, …) it finds and then short-circuits as already
+	// configured, but the setup test needs it to take the full generate+provision
+	// path. Drop legacy standard-named keys from earlier harness versions.
+	for _, legacy := range []string{"id_ed25519", "id_ed25519.pub"} {
+		os.Remove(filepath.Join(sshDir, legacy))
+	}
+	key := filepath.Join(sshDir, harnessKeyName)
 	if _, err := os.Stat(key); err != nil {
 		if err := runCmd("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "macmigrate-integration-test", "-f", key); err != nil {
 			return fmt.Errorf("generating test key: %w", err)
@@ -296,6 +315,34 @@ func (f *fixture) runMigrate(t *testing.T, extra ...string) (string, int) {
 		code = ee.ExitCode()
 	}
 	t.Logf("macmigrate %s (exit %d):\n%s", strings.Join(args, " "), code, out.String())
+	return out.String(), code
+}
+
+// runAsTestUser runs the built binary as the (unprivileged) test user — the
+// way setup and cleanup run in real life, where they are NOT under sudo. env(1)
+// pins HOME because the binary resolves ~/.ssh through it.
+func runAsTestUser(t *testing.T, args ...string) (string, int) {
+	t.Helper()
+	argv := append([]string{
+		"-u", testUser, "env",
+		"HOME=" + testHome,
+		"PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+		binPath,
+	}, args...)
+	cmd := exec.Command("sudo", argv...)
+	cmd.Dir = t.TempDir()
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	err := cmd.Run()
+	code := 0
+	if err != nil {
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) {
+			t.Fatalf("running %s as %s: %v\n%s", binPath, testUser, err, out.String())
+		}
+		code = ee.ExitCode()
+	}
+	t.Logf("macmigrate %s (as %s, exit %d):\n%s", strings.Join(args, " "), testUser, code, out.String())
 	return out.String(), code
 }
 
@@ -500,4 +547,94 @@ func TestIntegrationDryRun(t *testing.T) {
 	assertAbsent(t, filepath.Join(f.remoteHome, "Documents"))
 	assertAbsent(t, filepath.Join(f.remoteRoot, "Applications/Foo.app"))
 	assertAbsent(t, filepath.Join(f.remoteRoot, "Library/Fonts"))
+}
+
+// TestIntegrationSetupAndCleanup drives the full provision/undo cycle as the
+// test user: `setup` generates ~/.ssh/id_macmigrate (the harness key has a
+// non-standard name precisely so no existing key is reused), installs it in
+// authorized_keys, and writes the sudoers grant; a second run takes the
+// idempotent fast path; `cleanup` then reverses both without touching the
+// harness's own key. It runs unattended because the master connection
+// authenticates via the harness key (ssh config) and the remote sudo is
+// already passwordless via the harness's separate sudoers file.
+func TestIntegrationSetupAndCleanup(t *testing.T) {
+	requireEnv(t)
+	generatedKey := filepath.Join(testHome, ".ssh", "id_macmigrate")
+	authKeys := filepath.Join(testHome, ".ssh", "authorized_keys")
+	removeArtifacts := func() {
+		os.Remove(generatedKey)
+		os.Remove(generatedKey + ".pub")
+		os.Remove(migrate.SudoersPath)
+	}
+	removeArtifacts() // a previous failed run must not short-circuit this one
+	t.Cleanup(removeArtifacts)
+
+	// First run: full path — keygen, key install, sudoers install, verification.
+	out, code := runAsTestUser(t, "setup", testUser+"@localhost")
+	if code != 0 {
+		t.Fatalf("setup exited %d", code)
+	}
+	for _, want := range []string{"Generated a new SSH key", "✓ Key-based ssh works", "✓ Passwordless sudo configured"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("setup output missing %q", want)
+		}
+	}
+	if uid, gid := statUIDGID(t, generatedKey); uid != testUID || gid != testGID {
+		t.Errorf("%s owned by %d:%d, want %d:%d", generatedKey, uid, gid, testUID, testGID)
+	}
+	pub, err := os.ReadFile(generatedKey + ".pub")
+	if err != nil {
+		t.Fatalf("setup did not generate a public key: %v", err)
+	}
+	pubLine := strings.TrimSpace(string(pub))
+	if ak := readFile(t, authKeys); !strings.Contains(ak, pubLine) {
+		t.Errorf("authorized_keys does not contain the generated key:\n%s", ak)
+	}
+	wantSudoers := testUser + " ALL=(ALL) NOPASSWD: ALL\n"
+	assertContent(t, migrate.SudoersPath, wantSudoers)
+	if fi, err := os.Stat(migrate.SudoersPath); err == nil && fi.Mode().Perm() != 0o440 {
+		t.Errorf("%s mode = %v, want 0440", migrate.SudoersPath, fi.Mode().Perm())
+	}
+
+	// Second run: everything in place — the prompt-free fast path.
+	out, code = runAsTestUser(t, "setup", testUser+"@localhost")
+	if code != 0 {
+		t.Fatalf("re-run of setup exited %d", code)
+	}
+	if !strings.Contains(out, "✓ Already set up") {
+		t.Errorf("re-run of setup did not take the fast path")
+	}
+
+	// Cleanup: sudoers grant and installed key removed, harness key untouched.
+	out, code = runAsTestUser(t, "cleanup", testUser+"@localhost")
+	if code != 0 {
+		t.Fatalf("cleanup exited %d", code)
+	}
+	for _, want := range []string{"✓ sudoers grant removed", "✓ public key removed"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("cleanup output missing %q", want)
+		}
+	}
+	assertAbsent(t, migrate.SudoersPath)
+	harnessPub := strings.TrimSpace(readFile(t, filepath.Join(testHome, ".ssh", harnessKeyName+".pub")))
+	ak := readFile(t, authKeys)
+	if strings.Contains(ak, pubLine) {
+		t.Errorf("authorized_keys still contains the macmigrate key after cleanup:\n%s", ak)
+	}
+	if !strings.Contains(ak, harnessPub) {
+		t.Errorf("cleanup removed the harness key from authorized_keys:\n%s", ak)
+	}
+	// The very access the harness depends on must have survived cleanup.
+	if err := runCmd("sudo", "-u", testUser, "ssh", testUser+"@localhost", "true"); err != nil {
+		t.Errorf("ssh as %s broken after cleanup: %v", testUser, err)
+	}
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	return string(b)
 }

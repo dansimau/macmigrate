@@ -227,7 +227,9 @@ End-to-end integration tests build the real binary and migrate fixture trees
 re-rooted into temporary directories via `sync`'s `--root`/`--remote-root` flags
 (testing-only; both default to `/`). They exercise the full destination path —
 key-based ssh, passwordless `sudo -n /usr/bin/rsync`, remote-dir preparation,
-skip/exclude rules, and ownership preservation across three different owners:
+skip/exclude rules, and ownership preservation across three different owners —
+plus the `setup`/`cleanup` cycle: key generation, authorized_keys install, the
+sudoers grant, setup's idempotent fast path, and cleanup's reversal of it all:
 
 ```sh
 sudo go test -tags=integration -count=1 .
