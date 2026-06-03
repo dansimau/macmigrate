@@ -20,6 +20,12 @@ const SudoersPath = "/etc/sudoers.d/macmigrate"
 // remote login shell ($HOME, not ~, so it also resolves under sudo-free ssh).
 const authorizedKeysPath = "$HOME/.ssh/authorized_keys"
 
+// authorizedKeyTag is appended (as part of the comment field, which sshd
+// ignores) to every authorized_keys line setup installs. cleanup removes only
+// tagged lines, so a key that was authorized before macmigrate ever ran — the
+// user's own key, installed by the user — is never removed.
+const authorizedKeyTag = "# added-by-macmigrate"
+
 // MasterSession is an ssh ControlMaster connection that setup's commands
 // multiplex over, so the user authenticates exactly once for the whole
 // provisioning phase. ssh owns all prompting (password, host key) directly on
@@ -96,12 +102,13 @@ func (m *MasterSession) Close() {
 	os.RemoveAll(m.dir)
 }
 
-// Provision installs pubKey in the destination's authorized_keys and writes the
-// passwordless-sudo drop-in as one remote command. Run it over a MasterSession
-// connection with TTY set: the session is already authenticated, and the pty
-// lets the remote sudo prompt for its password on the user's terminal.
-func Provision(ctx context.Context, s SSH, dest, pubKey string) error {
-	if err := s.Run(ctx, dest, provisionCmd(pubKey)); err != nil {
+// Provision installs the public key (line pubKey, base64 body keyBody) in the
+// destination's authorized_keys and writes the passwordless-sudo drop-in as one
+// remote command. Run it over a MasterSession connection with TTY set: the
+// session is already authenticated, and the pty lets the remote sudo prompt
+// for its password on the user's terminal.
+func Provision(ctx context.Context, s SSH, dest, pubKey, keyBody string) error {
+	if err := s.Run(ctx, dest, provisionCmd(pubKey, keyBody)); err != nil {
 		return fmt.Errorf("provisioning %s: %w", dest, err)
 	}
 	return nil
@@ -109,23 +116,28 @@ func Provision(ctx context.Context, s SSH, dest, pubKey string) error {
 
 // provisionCmd chains the key install and the sudoers install into one remote
 // command, so both happen in the single authenticated session.
-func provisionCmd(pubKey string) string {
-	return installAuthorizedKeyCmd(pubKey) + " && " + installSudoersCmd()
+func provisionCmd(pubKey, keyBody string) string {
+	return installAuthorizedKeyCmd(pubKey, keyBody) + " && " + installSudoersCmd()
 }
 
 // installAuthorizedKeyCmd builds the idempotent key-install command: ensure
 // ~/.ssh (700) and authorized_keys (600) exist and that the file ends in a
 // newline (an unterminated last line would swallow the appended key into the
-// previous entry's comment), then append the key only if an identical line
-// isn't already present (grep -qxF), so re-running setup is safe.
-func installAuthorizedKeyCmd(pubKey string) string {
-	q := shellescape.Quote(pubKey)
+// previous entry's comment), then append the key — tagged so cleanup can tell
+// it apart from entries it must not touch — only if its base64 body isn't
+// already present. Matching on the body (not the whole line) makes re-running
+// setup safe AND leaves a pre-existing entry for the user's own key alone even
+// when its comment differs from the local .pub's: the key is already
+// authorized, so nothing is added and nothing gets tagged for later removal.
+func installAuthorizedKeyCmd(pubKey, keyBody string) string {
+	line := shellescape.Quote(pubKey + " " + authorizedKeyTag)
+	body := shellescape.Quote(keyBody)
 	f := authorizedKeysPath
 	return "mkdir -p ~/.ssh && chmod 700 ~/.ssh" +
 		" && touch " + f + " && chmod 600 " + f +
 		" && { [ ! -s " + f + ` ] || [ -z "$(tail -c1 ` + f + `)" ] || echo >> ` + f + "; }" +
-		" && { grep -qxF " + q + " " + f +
-		" || printf '%s\\n' " + q + " >> " + f + "; }"
+		" && { grep -qF " + body + " " + f +
+		" || printf '%s\\n' " + line + " >> " + f + "; }"
 }
 
 // installSudoersCmd grants the destination login user passwordless sudo via a
@@ -157,22 +169,26 @@ func RemoveSudoers(ctx context.Context, s SSH, dest string) error {
 	return s.Run(ctx, dest, "sudo rm -f "+shellescape.Quote(SudoersPath))
 }
 
-// RemoveAuthorizedKey strips every authorized_keys line containing keyBody (the
-// key's base64 body, matched so a differing trailing comment doesn't hide it)
-// from the destination user's authorized_keys. It is a no-op when the file is
-// absent and needs no sudo — it's the user's own file.
+// RemoveAuthorizedKey strips the authorized_keys line(s) setup added for this
+// key — those carrying both keyBody (the key's base64 body) and the macmigrate
+// tag — from the destination user's authorized_keys. An entry for the same key
+// that predates setup has no tag and survives, so cleanup can never revoke
+// access the user had independently of macmigrate. It is a no-op when the file
+// is absent and needs no sudo — it's the user's own file.
 func RemoveAuthorizedKey(ctx context.Context, s SSH, dest, keyBody string) error {
 	return s.Run(ctx, dest, removeAuthorizedKeyCmd(keyBody))
 }
 
-// removeAuthorizedKeyCmd rewrites authorized_keys without the matching line(s).
-// grep -vF can exit 1 when it selects nothing (e.g. the key was the only line),
-// so `|| true` keeps that from aborting the rewrite; the tmp file is then moved
-// back, preserving 600.
+// removeAuthorizedKeyCmd rewrites authorized_keys without the line(s) matching
+// "<body>…<tag>". Both sides of the pattern are literal under grep's default
+// BRE — the base64 alphabet ([A-Za-z0-9+/=]; + is only special in ERE) and the
+// tag contain no BRE metacharacters. grep -v can exit 1 when it selects
+// nothing (e.g. the tagged key was the only line), so `|| true` keeps that
+// from aborting the rewrite; the tmp file is then moved back, preserving 600.
 func removeAuthorizedKeyCmd(keyBody string) string {
 	f := authorizedKeysPath
-	q := shellescape.Quote(keyBody)
+	q := shellescape.Quote(keyBody + ".*" + authorizedKeyTag)
 	return "if [ -f " + f + " ]; then " +
-		"grep -vF " + q + " " + f + " > " + f + ".macmigrate.tmp || true; " +
+		"grep -v -e " + q + " " + f + " > " + f + ".macmigrate.tmp || true; " +
 		"mv " + f + ".macmigrate.tmp " + f + "; chmod 600 " + f + "; fi"
 }

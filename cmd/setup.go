@@ -10,13 +10,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var (
-	setupSkipKeygen bool
-	setupIdentity   string
-)
+var setupSkipKeygen bool
 
 var setupCmd = &cobra.Command{
-	Use:   "setup <dest>",
+	Use:   "setup",
 	Short: "Provision key-based ssh and passwordless sudo on the destination",
 	Long: "setup prepares a destination Mac so `macmigrate sync` can run unattended:\n" +
 		"  1. Uses an existing SSH key (or generates ~/.ssh/" + macmigrateKeyName + ").\n" +
@@ -25,17 +22,19 @@ var setupCmd = &cobra.Command{
 		"Steps 2 and 3 share a single ssh session (ControlMaster), so you authenticate\n" +
 		"to ssh once; the remote sudo may additionally ask for its password. Re-running\n" +
 		"setup is safe (and prompt-free when there is nothing left to do).",
-	Args: cobra.ExactArgs(1),
+	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runSetup(cmd.Context(), args[0])
+		dest, err := destAddr()
+		if err != nil {
+			return err
+		}
+		return runSetup(cmd.Context(), dest)
 	},
 }
 
 func init() {
 	setupCmd.Flags().BoolVar(&setupSkipKeygen, "skip-keygen", false,
 		"don't generate a key; require an existing key (use -i to pick one)")
-	setupCmd.Flags().StringVarP(&setupIdentity, "identity", "i", "",
-		"SSH key to install (defaults to an existing key, else a generated one)")
 	rootCmd.AddCommand(setupCmd)
 }
 
@@ -45,17 +44,17 @@ func runSetup(ctx context.Context, dest string) error {
 		return fail("locating your home directory: %v", err)
 	}
 
-	identity, generated, err := resolveSetupIdentity(home, setupIdentity, setupSkipKeygen)
+	keyPath, generated, err := resolveSetupIdentity(home, identity, setupSkipKeygen)
 	if err != nil {
 		return fail("%v", err)
 	}
 	if generated {
-		fmt.Printf("Generated a new SSH key: %s\n", identity)
+		fmt.Printf("Generated a new SSH key: %s\n", keyPath)
 	} else {
-		fmt.Printf("Using existing SSH key: %s\n", identity)
+		fmt.Printf("Using existing SSH key: %s\n", keyPath)
 	}
 
-	pubLine, _, err := readPubKey(identity)
+	pubLine, pubBody, err := readPubKey(keyPath)
 	if err != nil {
 		return fail("%v", err)
 	}
@@ -63,7 +62,7 @@ func runSetup(ctx context.Context, dest string) error {
 	// Idempotent fast path: if the key is already authorized and sudo is already
 	// passwordless, there is nothing to do — and nothing to prompt for. A key
 	// generated moments ago can't be authorized yet, so skip the probe.
-	keySSH := migrate.SSH{Identity: identity, BatchMode: true}
+	keySSH := migrate.SSH{Identity: keyPath, BatchMode: true}
 	if !generated && migrate.VerifyKey(ctx, keySSH, dest) == nil && keySSH.CanSudo(ctx, dest) {
 		fmt.Printf("✓ Already set up: key auth and passwordless sudo both work on %s\n", dest)
 		return nil
@@ -74,7 +73,7 @@ func runSetup(ctx context.Context, dest string) error {
 	// multiplex over it. The key is offered first, so a re-run where it is
 	// already authorized connects without any ssh prompt.
 	fmt.Printf("Connecting to %s …\n", dest)
-	master, err := migrate.OpenMaster(ctx, migrate.SSH{Identity: identity}, dest)
+	master, err := migrate.OpenMaster(ctx, migrate.SSH{Identity: keyPath}, dest)
 	if err != nil {
 		return fail("%v", err)
 	}
@@ -84,7 +83,7 @@ func runSetup(ctx context.Context, dest string) error {
 	mux := master.SSH()
 	mux.TTY = true
 	fmt.Printf("Installing the public key and passwordless sudo on %s …\n", dest)
-	if err := migrate.Provision(ctx, mux, dest, pubLine); err != nil {
+	if err := migrate.Provision(ctx, mux, dest, pubLine, pubBody); err != nil {
 		return fail("%v", err)
 	}
 
@@ -99,11 +98,11 @@ func runSetup(ctx context.Context, dest string) error {
 	}
 	fmt.Println("✓ Passwordless sudo configured")
 
-	fmt.Printf("\nDone. Run:  macmigrate sync %s\n", dest)
+	fmt.Printf("\nDone. Run:  macmigrate %s sync\n", destFlags())
 	if generated {
-		fmt.Printf("(sync auto-detects %s; no extra flags needed.)\n", identity)
+		fmt.Printf("(sync auto-detects %s; no extra flags needed.)\n", keyPath)
 	}
-	fmt.Printf("Undo on the destination with:  macmigrate cleanup %s\n", dest)
+	fmt.Printf("Undo on the destination with:  macmigrate %s cleanup\n", destFlags())
 	return nil
 }
 
