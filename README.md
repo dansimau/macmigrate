@@ -14,7 +14,7 @@ link (e.g. a Thunderbolt bridge / direct ethernet cable) is actually saturated.
   (`/usr/local`, `/opt/homebrew`) are copied to the **same absolute path** on the
   destination, one job per subdirectory. The root is created if missing (but not
   chowned — some roots like `/usr/local` are SIP-protected); the entries inside
-  are copied with their own ownership. Add your own with `-include`.
+  are copied with their own ownership. Add your own with `--include`.
 - **Nested dirs are autodetected.** If you list both a directory and something
   inside it (the default list includes `/opt/homebrew` **and**
   `/opt/homebrew/Cellar`), the inner one is split into its own parallel jobs and
@@ -48,12 +48,13 @@ sudo for your remote login user** — that part runs remotely and is unchanged.
 - **rsync ≥ 3.1** on the source (for `--info=progress2`). macOS's Homebrew
   `rsync` works; stock `/usr/bin/rsync` may be too old (it must be on `PATH`).
 - **Remote Login (SSH)** enabled on the destination
-  (System Settings ▸ General ▸ Sharing), with **key-based auth** set up —
-  parallel jobs can't answer password prompts.
-- **Passwordless sudo** on the destination. Every transfer runs as `sudo rsync`
-  so file ownership is preserved (your home directory included), and sudo can't
-  prompt for a password across parallel ssh connections, so it must be
-  non-interactive. On the **destination**:
+  (System Settings ▸ General ▸ Sharing).
+- **Key-based ssh + passwordless sudo** on the destination. Parallel jobs can't
+  answer password prompts, and every transfer runs as `sudo rsync` so file
+  ownership is preserved (your home directory included), which means sudo must be
+  non-interactive. **`macmigrate setup <dest>` configures both for you** (see
+  [Commands](#commands)); `macmigrate cleanup <dest>` undoes it afterward. To set
+  it up by hand instead, install an authorized key and, on the **destination**:
 
   ```sh
   echo "$(id -un) ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/macmigrate >/dev/null
@@ -61,7 +62,8 @@ sudo for your remote login user** — that part runs remotely and is unchanged.
   # remove /etc/sudoers.d/macmigrate when the migration is done
   ```
 
-  macmigrate checks this up front and exits with this guidance if it's missing.
+  `sync` checks both up front and exits with guidance (pointing at `setup`) if
+  they're missing.
 - **Full Disk Access** for the terminal running it (to read parts of `~/Library`).
   macmigrate detects this during preflight (it probes the user's TCC database,
   which is only readable with FDA) and prints a clear warning if it's missing —
@@ -76,45 +78,91 @@ During the migration macmigrate keeps **both** Macs awake with `caffeinate -s`
 go build -o macmigrate .
 ```
 
-## Usage
+## Commands
 
-Run it **without** `sudo` — it re-runs itself under `sudo` and prompts for your
-password.
+macmigrate has three subcommands. `<dest>` is a positional `[user@]host`
+argument (e.g. `169.254.190.76` or `user@mac2.local`).
 
 ```sh
-# Everything (home + apps + default dirs) to a directly-connected Mac:
-./macmigrate -dest 169.254.190.76
-
-# Preview first — exercises the whole pipeline, writes nothing:
-./macmigrate -dest 169.254.190.76 -n
-
-# 12 parallel jobs:
-./macmigrate -dest user@mac2.local -j 12
-
-# Skip an extra Library subdir:
-./macmigrate -dest mac2.local -exclude Library/Containers
-
-# Add an extra directory beyond the defaults:
-./macmigrate -dest mac2.local -include /opt/local
+macmigrate setup <dest>     # one-time: key-based ssh + passwordless sudo
+macmigrate sync <dest>      # the migration (re-runs itself under sudo)
+macmigrate cleanup <dest>   # undo setup on the destination
 ```
 
-### Flags
+### `setup <dest>`
 
-| Flag        | Default        | Description                                                                 |
-|-------------|----------------|-----------------------------------------------------------------------------|
-| `-dest`     | *(required)*   | Destination `[user@]host`                                                   |
-| `-j`        | `4`            | Max parallel rsync jobs                                                     |
-| `-include`  | see below      | Additional absolute directory to migrate (repeatable)                       |
-| `-n`        | `false`        | Dry run (`--dry-run`); writes nothing                                       |
-| `-exclude`  | see below      | `$HOME`-relative entry to skip (repeatable)                                 |
-| `-user`     | invoking user  | Username whose home (`/Users/<user>`) to migrate; set automatically on the sudo re-run |
+Provisions the destination so `sync` runs unattended. It:
+
+1. **Reuses an existing SSH key** — a previously generated `~/.ssh/id_macmigrate`
+   first, then a standard key (`id_ed25519`, `id_rsa`, …) — otherwise
+   **generates `~/.ssh/id_macmigrate`** (a distinct name so `sync` and `cleanup`
+   can recognise it). Pass `-i <path>` to choose a key, or `--skip-keygen` to
+   require an existing one rather than generating.
+2. **Installs the public key** in the destination's `authorized_keys` (creating
+   `~/.ssh` with 700 / the file with 600).
+3. **Grants passwordless sudo** to the destination login user via
+   `/etc/sudoers.d/macmigrate` (validated with `visudo -cf`).
+
+Steps 2 and 3 share a **single ssh session** (a `ControlMaster` connection,
+used for setup only): you authenticate to ssh once, and the provisioning
+commands multiplex over that session; the remote `sudo` may additionally ask
+for its password. ssh does all the prompting itself on your terminal — the
+password never passes through macmigrate. `setup` is idempotent — re-running
+it is safe, and prompt-free when everything is already configured.
+
+### `cleanup <dest>`
+
+Reverses `setup` on the destination: removes `/etc/sudoers.d/macmigrate` and the
+macmigrate public key from the destination's `authorized_keys`. The locally
+generated key is left in place (delete `~/.ssh/id_macmigrate` by hand if you no
+longer want it). Pass `-i <path>` if you installed a non-default key.
+
+## Usage
+
+Run `sync` **without** `sudo` — it re-runs itself under `sudo` and prompts for
+your password.
+
+```sh
+# One-time setup of a directly-connected Mac:
+./macmigrate setup 169.254.190.76
+
+# Everything (home + apps + default dirs):
+./macmigrate sync 169.254.190.76
+
+# Preview first — exercises the whole pipeline, writes nothing:
+./macmigrate sync 169.254.190.76 -n
+
+# 12 parallel jobs:
+./macmigrate sync user@mac2.local -j 12
+
+# Skip an extra Library subdir:
+./macmigrate sync mac2.local --exclude Library/Containers
+
+# Add an extra directory beyond the defaults:
+./macmigrate sync mac2.local --include /opt/local
+
+# Tear down when finished:
+./macmigrate cleanup 169.254.190.76
+```
+
+### `sync` flags
+
+| Flag             | Default        | Description                                                                 |
+|------------------|----------------|-----------------------------------------------------------------------------|
+| `-j`, `--jobs`   | `4`            | Max parallel rsync jobs                                                     |
+| `-n`, `--dry-run`| `false`        | Dry run (`--dry-run`); writes nothing                                       |
+| `-i`, `--identity`| auto          | SSH key to connect with; defaults to `~/.ssh/id_macmigrate` if present, else ssh's default |
+| `--include`      | see below      | Additional absolute directory to migrate (repeatable)                       |
+| `--exclude`      | see below      | `$HOME`-relative entry to skip (repeatable)                                 |
+| `--user`         | invoking user  | Username whose home (`/Users/<user>`) to migrate; set automatically on the sudo re-run |
+| `--debug`        | `false`        | Print diagnostics (app selection, full rsync commands) to stderr           |
 
 Defaults add to (don't replace) the built-ins:
 
-- `-exclude`: `.Trash`, `Library/Caches`, `Library/Accounts`,
+- `--exclude`: `.Trash`, `Library/Caches`, `Library/Accounts`,
   `Library/AppleMediaServices`, `Library/Mobile Documents` (iCloud Drive —
   re-syncs from the cloud on the new Mac).
-- `-include`: the Homebrew prefixes `/usr/local`, `/opt/homebrew`,
+- `--include`: the Homebrew prefixes `/usr/local`, `/opt/homebrew`,
   `/opt/homebrew/Cellar`, plus the system-wide `/Library` items that hold
   third-party data not under `$HOME` — `/Library/Application Support`,
   `/Library/Fonts`, `/Library/Audio`, `/Library/ColorSync`,
@@ -123,7 +171,7 @@ Defaults add to (don't replace) the built-ins:
   on the destination, as root; the root is created if missing but not chowned.
   Listing a nested pair (like `/opt/homebrew` + `/opt/homebrew/Cellar`) makes the
   inner one split independently and be skipped by the outer — list any large
-  nested tree to parallelize it. (`-include` paths must exist; missing defaults
+  nested tree to parallelize it. (`--include` paths must exist; missing defaults
   are silently skipped.)
 
 ## Output & logging
@@ -166,5 +214,5 @@ data still copied. Process exit code:
 To actually copy that protected data, grant **Full Disk Access** to the terminal
 (System Settings ▸ Privacy & Security ▸ Full Disk Access) and re-run — most
 partials disappear. A few system stores (e.g. `com.apple.TCC`) can never be
-copied; `-exclude` them.
+copied; `--exclude` them.
 

@@ -182,7 +182,7 @@ func TestBuildJobsChownPaths(t *testing.T) {
 	}
 
 	opt := Options{
-		Dest: "h", SSHUser: "olduser", Home: home, RemoteHome: "/remote",
+		Dest: "h", SSH: SSH{User: "olduser"}, Home: home, RemoteHome: "/remote",
 		SkipNames: DefaultSkip, RsyncExclude: DefaultRsyncExclude, DoHome: true,
 		ChownUID: "501",
 	}

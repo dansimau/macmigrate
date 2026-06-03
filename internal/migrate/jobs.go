@@ -104,7 +104,7 @@ func chownFor(opt Options, path string, recurse bool) *Chown {
 // Options controls construction of the job list.
 type Options struct {
 	Dest         string   // [user@]host
-	SSHUser      string   // local user to run ssh as (root drops to it; see sshArgv); "" => plain ssh
+	SSH          SSH      // how to reach the destination over ssh (user/identity)
 	Home         string   // local $HOME
 	RemoteHome   string   // resolved destination $HOME
 	Dirs         []string // additional absolute directories to migrate (copied to the same path, as root)
@@ -257,7 +257,7 @@ func subdirJob(opt Options, label, localDir, remoteDir string) Job {
 		Srcs:        []string{ensureSlash(localDir)},
 		Dst:         opt.Dest + ":" + ensureSlash(remoteDir),
 		Excludes:    opt.RsyncExclude,
-		RemoteShell: RsyncRemoteShell(opt.SSHUser),
+		RemoteShell: opt.SSH.RsyncRemoteShell(),
 		Chown:       chownFor(opt, remoteDir, true),
 	}
 }
@@ -271,7 +271,7 @@ func looseFilesJob(opt Options, label string, files []string, remoteDir string) 
 		Srcs:        files,
 		Dst:         opt.Dest + ":" + ensureSlash(remoteDir),
 		Excludes:    opt.RsyncExclude,
-		RemoteShell: RsyncRemoteShell(opt.SSHUser),
+		RemoteShell: opt.SSH.RsyncRemoteShell(),
 		Chown:       chownFor(opt, remoteDir, false),
 	}
 }
@@ -280,7 +280,7 @@ func looseFilesJob(opt Options, label string, files []string, remoteDir string) 
 // job per local .app that is not already present — the skip-if-exists behaviour
 // of migrate.sh's copy_apps.
 func appJobs(ctx context.Context, opt Options) ([]Job, []string, error) {
-	existing, err := remoteList(ctx, opt.SSHUser, opt.Dest, applicationsDir)
+	existing, err := opt.SSH.remoteList(ctx, opt.Dest, applicationsDir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("listing %s on %s: %w", applicationsDir, opt.Dest, err)
 	}
@@ -318,7 +318,7 @@ func appJobs(ctx context.Context, opt Options) ([]Job, []string, error) {
 			Srcs:        []string{filepath.Join(applicationsDir, name)}, // no trailing slash: copy the bundle itself
 			Dst:         opt.Dest + ":" + applicationsDir + "/",
 			Excludes:    opt.RsyncExclude,
-			RemoteShell: RsyncRemoteShell(opt.SSHUser),
+			RemoteShell: opt.SSH.RsyncRemoteShell(),
 			Chown:       chownFor(opt, applicationsDir+"/"+name, true), // scoped to the copied bundle
 		})
 	}
