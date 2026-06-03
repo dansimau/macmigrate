@@ -9,15 +9,18 @@ actually saturated.
 ```sh
 go build -o macmigrate .
 
-./macmigrate setup 169.254.190.76     # one-time: ssh key + passwordless sudo
-./macmigrate sync 169.254.190.76 -n   # dry run — writes nothing
-./macmigrate sync 169.254.190.76     # the migration
-./macmigrate cleanup 169.254.190.76   # undo setup when done
+./macmigrate --dest 169.254.190.76 setup     # one-time: ssh key + passwordless sudo
+./macmigrate --dest 169.254.190.76 sync -n   # dry run — writes nothing
+./macmigrate --dest 169.254.190.76 sync      # the migration
+./macmigrate --dest 169.254.190.76 cleanup   # undo setup when done
 ```
 
-`<dest>` is `[user@]host`. Run `sync` **without** `sudo` — it re-runs itself
-under `sudo -E` (one password prompt) so rsync can read every file, while all
-ssh connections still run as you (your keys, your agent).
+`--dest` is required; add `--dest-user` when the destination login user
+differs from your local one. The shared flags go before the subcommand, so
+moving to the next step is just replacing the last word. Run `sync` **without**
+`sudo` — it re-runs itself under `sudo -E` (one password prompt) so rsync can
+read every file, while all ssh connections still run as you (your keys, your
+agent).
 
 ## What gets copied
 
@@ -47,30 +50,38 @@ ssh connections still run as you (your keys, your agent).
 
 ## Commands
 
-### `setup <dest>`
+Flags shared by every subcommand (put them before the subcommand):
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dest` | — | Destination IP or hostname (**required**) |
+| `--dest-user` | your username | Login user on the destination |
+| `-i`, `--identity` | auto | SSH key (`~/.ssh/id_macmigrate` if present) |
+| `--debug` | off | Diagnostics to stderr |
+
+### `setup`
 
 Reuses an existing ssh key (or generates `~/.ssh/id_macmigrate`), installs it
 in the destination's `authorized_keys`, and grants passwordless sudo via
 `/etc/sudoers.d/macmigrate`. One ssh authentication total; all prompting is
-ssh's own. Idempotent — re-running is safe. Flags: `-i <key>`, `--skip-keygen`.
+ssh's own. Idempotent — re-running is safe. Flags: `--skip-keygen`.
 
-### `sync <dest>`
+### `sync`
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-j`, `--jobs` | `4` | Max parallel rsync jobs |
 | `-n`, `--dry-run` | off | Preview; writes nothing |
-| `-i`, `--identity` | auto | SSH key (`~/.ssh/id_macmigrate` if present) |
 | `--include` | Homebrew + `/Library` extras | Extra absolute dir (repeatable) |
 | `--exclude` | `.Trash`, caches, iCloud Drive | `$HOME`-relative skip (repeatable) |
-| `--debug` | off | Diagnostics to stderr |
 
 `--include`/`--exclude` add to the defaults rather than replacing them.
 
-### `cleanup <dest>`
+### `cleanup`
 
-Removes the sudoers entry and the macmigrate key from the destination. The
-local key is left in place.
+Removes the sudoers entry and the `authorized_keys` entries `setup` added
+(setup tags its entries, so a key you had authorized yourself is never
+removed). The local key is left in place.
 
 ## Output & exit codes
 

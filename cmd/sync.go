@@ -27,7 +27,6 @@ var (
 	syncUser       string
 	syncParallel   int
 	syncDryRun     bool
-	syncIdentity   string
 	syncExcludes   []string
 	syncIncludes   []string
 	syncRoot       string
@@ -35,16 +34,20 @@ var (
 )
 
 var syncCmd = &cobra.Command{
-	Use:   "sync <dest>",
+	Use:   "sync",
 	Short: "Migrate the home directory and apps to the destination",
 	Long: "sync copies $HOME, third-party /Applications, and a set of system\n" +
 		"directories to the destination over ssh, running many rsync transfers in\n" +
 		"parallel. It re-runs itself under sudo so rsync can read every local file.\n\n" +
-		"Run `macmigrate setup <dest>` first to configure key-based ssh and\n" +
-		"passwordless sudo on the destination.",
-	Args: cobra.ExactArgs(1),
+		"Run `macmigrate setup` first (same destination flags) to configure key-based\n" +
+		"ssh and passwordless sudo on the destination.",
+	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runSync(args[0])
+		dest, err := destAddr()
+		if err != nil {
+			return err
+		}
+		return runSync(dest)
 	},
 }
 
@@ -53,8 +56,6 @@ func init() {
 		"username whose home (/Users/<user>) to migrate; set automatically when re-running under sudo")
 	syncCmd.Flags().IntVarP(&syncParallel, "jobs", "j", 4, "maximum number of parallel rsync jobs")
 	syncCmd.Flags().BoolVarP(&syncDryRun, "dry-run", "n", false, "dry run: pass --dry-run to rsync (no files written)")
-	syncCmd.Flags().StringVarP(&syncIdentity, "identity", "i", "",
-		"SSH key to connect with (defaults to ~/.ssh/"+macmigrateKeyName+" if present, else ssh's default)")
 	syncCmd.Flags().StringArrayVar(&syncExcludes, "exclude", nil,
 		"home/Library entry to skip, e.g. 'Library/Containers' (repeatable; adds to defaults)")
 	syncCmd.Flags().StringArrayVar(&syncIncludes, "include", nil,
@@ -90,14 +91,14 @@ func runSync(dest string) error {
 	// ssh connects as the invoking user (root has no keys/agent). Resolve the
 	// identity from that user's ~/.ssh — auto-selecting the macmigrate key when
 	// setup generated one — so the connection uses it without an explicit -i.
-	identity, err := resolveSyncIdentity(home, syncIdentity)
+	keyPath, err := resolveSyncIdentity(home, identity)
 	if err != nil {
 		return fail("%v", err)
 	}
 	// BatchMode on every connection sync makes: parallel jobs (and the chown
 	// passes between them) can't answer a password prompt, so an auth failure
 	// mid-run must fail loudly instead of freezing the migration.
-	ssh := migrate.SSH{User: syncUser, Identity: identity, BatchMode: true}
+	ssh := migrate.SSH{User: syncUser, Identity: keyPath, BatchMode: true}
 
 	dirs, err := resolveDirs(syncRoot, migrate.DefaultDirs, syncIncludes)
 	if err != nil {
@@ -127,7 +128,7 @@ func runSync(dest string) error {
 	fmt.Printf("Connecting to %s …\n", dest)
 	rhome, err := ssh.RemoteHome(ctx, dest)
 	if err != nil {
-		return fail("%v\n\nRun `macmigrate setup %s` to configure key-based ssh, or enable Remote Login\non the destination (System Settings ▸ General ▸ Sharing) and set up key-based ssh\nso parallel jobs don't hit password prompts.", err, dest)
+		return fail("%v\n\nRun `macmigrate %s setup` to configure key-based ssh, or enable Remote Login\non the destination (System Settings ▸ General ▸ Sharing) and set up key-based ssh\nso parallel jobs don't hit password prompts.", err, destFlags())
 	}
 	if syncRemoteRoot != "/" {
 		// Under a test root the destination home keeps its resolved path —
@@ -415,7 +416,7 @@ func sudoRequiredError(dest string) error {
 		msg: fmt.Sprintf("passwordless sudo is not available on %s.\n", dest) +
 			"  Files are copied with `sudo rsync` so ownership is preserved, which can't\n" +
 			"  prompt for a password over parallel ssh connections.\n" +
-			fmt.Sprintf("  Run `macmigrate setup %s` to configure this automatically, or enable\n", dest) +
+			fmt.Sprintf("  Run `macmigrate %s setup` to configure this automatically, or enable\n", destFlags()) +
 			"  passwordless sudo for your user ON THE DESTINATION by hand, e.g.:\n" +
 			`    echo "$(id -un) ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/macmigrate >/dev/null` + "\n" +
 			"    sudo chmod 440 /etc/sudoers.d/macmigrate",

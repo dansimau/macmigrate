@@ -348,15 +348,17 @@ func newFixture(t *testing.T) *fixture {
 // --rsync-path — the version pairing of a real old-Mac migration.
 func (f *fixture) runMigrate(t *testing.T, extra ...string) (string, int) {
 	t.Helper()
-	return f.runMigrateTo(t, testUser+"@localhost", extra...)
+	return f.runMigrateTo(t, testUser, extra...)
 }
 
-// runMigrateTo is runMigrate with an explicit destination, for migrations to a
-// different destination user.
-func (f *fixture) runMigrateTo(t *testing.T, dest string, extra ...string) (string, int) {
+// runMigrateTo is runMigrate with an explicit destination user, for migrations
+// to a different destination user.
+func (f *fixture) runMigrateTo(t *testing.T, destUser string, extra ...string) (string, int) {
 	t.Helper()
 	args := []string{
-		"sync", dest,
+		"--dest", "localhost",
+		"--dest-user", destUser,
+		"sync",
 		"--user", testUser,
 		"--root", f.localRoot,
 		"--remote-root", f.remoteRoot,
@@ -670,7 +672,7 @@ func TestIntegrationCrossUserChown(t *testing.T) {
 	// (bundle-scoped) chown pass.
 	chownTree(t, filepath.Join(f.localRoot, "Applications/Foo.app"), testUID, testGID)
 
-	out, code := f.runMigrateTo(t, testUser2+"@localhost")
+	out, code := f.runMigrateTo(t, testUser2)
 	assertSuccess(t, out, code)
 	if want := fmt.Sprintf("Usernames differ (%s → %s)", testUser, testUser2); !strings.Contains(out, want) {
 		t.Errorf("output missing %q — chown pass not announced", want)
@@ -746,7 +748,7 @@ func TestIntegrationSetupAndCleanup(t *testing.T) {
 	t.Cleanup(removeArtifacts)
 
 	// First run: full path — keygen, key install, sudoers install, verification.
-	out, code := runAsTestUser(t, "setup", testUser+"@localhost")
+	out, code := runAsTestUser(t, "--dest", "localhost", "--dest-user", testUser, "setup")
 	if code != 0 {
 		t.Fatalf("setup exited %d", code)
 	}
@@ -773,7 +775,7 @@ func TestIntegrationSetupAndCleanup(t *testing.T) {
 	}
 
 	// Second run: everything in place — the prompt-free fast path.
-	out, code = runAsTestUser(t, "setup", testUser+"@localhost")
+	out, code = runAsTestUser(t, "--dest", "localhost", "--dest-user", testUser, "setup")
 	if code != 0 {
 		t.Fatalf("re-run of setup exited %d", code)
 	}
@@ -782,11 +784,11 @@ func TestIntegrationSetupAndCleanup(t *testing.T) {
 	}
 
 	// Cleanup: sudoers grant and installed key removed, harness key untouched.
-	out, code = runAsTestUser(t, "cleanup", testUser+"@localhost")
+	out, code = runAsTestUser(t, "--dest", "localhost", "--dest-user", testUser, "cleanup")
 	if code != 0 {
 		t.Fatalf("cleanup exited %d", code)
 	}
-	for _, want := range []string{"✓ sudoers grant removed", "✓ public key removed"} {
+	for _, want := range []string{"✓ sudoers grant removed", "✓ setup-added key entries removed"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("cleanup output missing %q", want)
 		}
