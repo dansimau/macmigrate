@@ -640,11 +640,27 @@ func TestIntegrationCrossUserChown(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The destination's ~/.ssh pre-exists — it must, for the migration's key
+	// auth to work at all. Owned by root (which sshd's StrictModes accepts),
+	// 0700, with the authorized_keys the migration depends on. If the sync
+	// transfers the .ssh directory node itself, rsync re-owns it to the source
+	// user and the (eventual) chown pass to the destination user — either of
+	// which on a real machine trips StrictModes and cuts off ssh mid-sync.
+	remoteSSH := filepath.Join(remoteHome2, ".ssh")
+	if err := os.MkdirAll(remoteSSH, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const remoteAuthKeys = "ssh-ed25519 REMOTEKEY the-key-the-migration-runs-over\n"
+	if err := os.WriteFile(filepath.Join(remoteSSH, "authorized_keys"), []byte(remoteAuthKeys), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	chownPath(t, filepath.Join(remoteSSH, "authorized_keys"), test2UID, test2GID)
+
 	// The source user owns their home content, as on a real Mac; root- and
 	// daemon-owned files prove the pass leaves other owners alone.
 	for _, p := range []string{
 		"Documents", "Documents/report.txt", "Documents/sub", "Documents/sub/deep.txt",
-		"notes.txt", "owned", "owned/user.txt",
+		"notes.txt", "owned", "owned/user.txt", ".ssh", ".ssh/id_test",
 	} {
 		chownPath(t, filepath.Join(f.home, p), testUID, testGID)
 	}
@@ -686,6 +702,26 @@ func TestIntegrationCrossUserChown(t *testing.T) {
 	// it keeps its owner — as stray root-owned files in a real home would.
 	if uid, _ := statUIDGID(t, filepath.Join(remoteHome2, ".hushlogin")); uid != 0 {
 		t.Errorf(".hushlogin owned by uid %d, want 0 (root-owned at source)", uid)
+	}
+
+	// THE INVARIANT THAT KEEPS THE MIGRATION ALIVE: the destination ~/.ssh
+	// directory's own owner and mode are never touched (sshd's StrictModes
+	// would otherwise refuse authorized_keys and kill every subsequent ssh
+	// connection — including the chown pass that would have repaired it), and
+	// the authorized_keys the migration authenticates with survives verbatim.
+	// The .ssh *contents* still migrate and get re-owned like everything else.
+	if uid, _ := statUIDGID(t, remoteSSH); uid != 0 {
+		t.Errorf("destination .ssh dir owned by uid %d, want 0 (untouched) — the .ssh directory node was transferred", uid)
+	}
+	if fi, err := os.Stat(remoteSSH); err == nil && fi.Mode().Perm() != 0o700 {
+		t.Errorf("destination .ssh dir mode = %v, want 0700 (untouched)", fi.Mode().Perm())
+	}
+	assertContent(t, filepath.Join(remoteSSH, "authorized_keys"), remoteAuthKeys)
+	if uid, _ := statUIDGID(t, filepath.Join(remoteSSH, "authorized_keys")); uid != test2UID {
+		t.Errorf("authorized_keys owned by uid %d, want %s (%d)", uid, testUser2, test2UID)
+	}
+	if uid, _ := statUIDGID(t, filepath.Join(remoteSSH, "id_test")); uid != test2UID {
+		t.Errorf(".ssh/id_test owned by uid %d, want %s (%d) — contents must still migrate and be re-owned", uid, testUser2, test2UID)
 	}
 }
 
