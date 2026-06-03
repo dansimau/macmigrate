@@ -15,12 +15,13 @@ func TestInstallAuthorizedKeyCmd(t *testing.T) {
 	// ~/.ssh and authorized_keys get the right modes before any write, the file
 	// is guaranteed to end in a newline before the key is appended (an
 	// unterminated last line would swallow the key into the previous entry),
-	// and the appended line carries the tag cleanup matches on.
+	// the presence check ignores comment lines, and the appended line carries
+	// the tag cleanup matches on.
 	for _, want := range []string{
 		"mkdir -p ~/.ssh && chmod 700 ~/.ssh",
 		"chmod 600 $HOME/.ssh/authorized_keys",
 		`[ -z "$(tail -c1 $HOME/.ssh/authorized_keys)" ] || echo >> $HOME/.ssh/authorized_keys`,
-		"grep -qF AAAAbody $HOME/.ssh/authorized_keys",
+		"grep -v -e '^[[:space:]]*#' $HOME/.ssh/authorized_keys | grep -qF AAAAbody",
 		"printf '%s\\n' 'ssh-ed25519 AAAAbody macmigrate@host " + authorizedKeyTag + "' >> $HOME/.ssh/authorized_keys",
 	} {
 		if !strings.Contains(got, want) {
@@ -85,6 +86,35 @@ func TestAuthorizedKeyInstallRemoveBehavior(t *testing.T) {
 		}
 		if !strings.Contains(string(ak), "AAAAother") {
 			t.Errorf("remove deleted an unrelated key:\n%s", ak)
+		}
+	})
+
+	t.Run("commented-out copy of the key does not suppress the install", func(t *testing.T) {
+		home := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(home, ".ssh"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		// The same key body exists only on lines sshd ignores: a comment line
+		// and an indented comment line. Neither authorizes the key, so setup
+		// must still append an active entry.
+		disabled := "# ssh-ed25519 " + body + " disabled-by-user\n" +
+			"  # ssh-ed25519 " + body + " also-disabled\n"
+		if err := os.WriteFile(akPath(home), []byte(disabled), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		runRemoteCmd(t, home, installAuthorizedKeyCmd(pub, body))
+		ak, _ := os.ReadFile(akPath(home))
+		if want := pub + " " + authorizedKeyTag + "\n"; !strings.Contains(string(ak), want) {
+			t.Fatalf("install did not append an active entry over commented-out copies:\n%s", ak)
+		}
+
+		// cleanup removes only the tagged active line; the user's commented-out
+		// lines (no tag) stay.
+		runRemoteCmd(t, home, removeAuthorizedKeyCmd(body))
+		ak, _ = os.ReadFile(akPath(home))
+		if string(ak) != disabled {
+			t.Errorf("remove did not restore the original commented-out-only file:\n%s", ak)
 		}
 	})
 

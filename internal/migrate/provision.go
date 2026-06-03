@@ -125,10 +125,13 @@ func provisionCmd(pubKey, keyBody string) string {
 // newline (an unterminated last line would swallow the appended key into the
 // previous entry's comment), then append the key — tagged so cleanup can tell
 // it apart from entries it must not touch — only if its base64 body isn't
-// already present. Matching on the body (not the whole line) makes re-running
-// setup safe AND leaves a pre-existing entry for the user's own key alone even
-// when its comment differs from the local .pub's: the key is already
-// authorized, so nothing is added and nothing gets tagged for later removal.
+// already present on an active line. Matching on the body (not the whole
+// line) makes re-running setup safe AND leaves a pre-existing entry for the
+// user's own key alone even when its comment differs from the local .pub's:
+// the key is already authorized, so nothing is added and nothing gets tagged
+// for later removal. Comment lines (sshd skips lines whose first non-blank
+// character is #) are filtered out first, so a commented-out copy of the key
+// can't masquerade as an active one and suppress the install.
 func installAuthorizedKeyCmd(pubKey, keyBody string) string {
 	line := shellescape.Quote(pubKey + " " + authorizedKeyTag)
 	body := shellescape.Quote(keyBody)
@@ -136,7 +139,7 @@ func installAuthorizedKeyCmd(pubKey, keyBody string) string {
 	return "mkdir -p ~/.ssh && chmod 700 ~/.ssh" +
 		" && touch " + f + " && chmod 600 " + f +
 		" && { [ ! -s " + f + ` ] || [ -z "$(tail -c1 ` + f + `)" ] || echo >> ` + f + "; }" +
-		" && { grep -qF " + body + " " + f +
+		" && { grep -v -e '^[[:space:]]*#' " + f + " | grep -qF " + body +
 		" || printf '%s\\n' " + line + " >> " + f + "; }"
 }
 
