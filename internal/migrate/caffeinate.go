@@ -6,8 +6,8 @@ import (
 )
 
 // Caffeinate keeps both Macs awake for the duration of the migration: a local
-// `caffeinate -s` and, when dest is non-empty, a remote one over ssh (run as
-// asUser, like every other ssh connection). It returns a stop function to call
+// `caffeinate -s` and, when dest is non-empty, a remote one over ssh (reached
+// via ssh, like every other connection). It returns a stop function to call
 // when the migration ends — typically deferred.
 //
 // Each child is started in its own process group so stop can signal the whole
@@ -15,7 +15,7 @@ import (
 // as ssh, and closing the ssh channel makes sshd HUP the remote caffeinate.
 // Caffeinate is best-effort — a child that fails to start is skipped silently,
 // since sleep prevention is a convenience, not a correctness requirement.
-func Caffeinate(asUser, dest string) (stop func()) {
+func Caffeinate(ssh SSH, dest string) (stop func()) {
 	var procs []*exec.Cmd
 	start := func(name string, arg ...string) {
 		cmd := exec.Command(name, arg...)
@@ -29,7 +29,7 @@ func Caffeinate(asUser, dest string) (stop func()) {
 
 	start("caffeinate", "-s")
 	if dest != "" {
-		argv := append(sshArgv(asUser), dest, "caffeinate -s")
+		argv := append(ssh.prefix(), dest, "caffeinate -s")
 		start(argv[0], argv[1:]...)
 	}
 

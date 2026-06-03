@@ -4,40 +4,64 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	"al.essio.dev/pkg/shellescape"
 	"github.com/dansimau/macmigrate/internal/xexec"
 )
 
-// sshArgv returns the local argv that launches ssh. After the sudo re-exec the
-// whole process runs as root, but ssh must run in the invoking user's context so
-// it uses that user's ssh-agent, keys and known_hosts (root has none of these).
-// When asUser is set, ssh is launched via `sudo -E -u <asUser> ssh` — root can
-// drop to any user without a password, and -E carries SSH_AUTH_SOCK through.
-// Empty asUser uses ssh directly.
-func sshArgv(asUser string) []string {
-	if asUser == "" {
-		return []string{"ssh"}
+// SSH describes how to reach the destination over ssh. After the sudo re-exec
+// the migration runs as root, but ssh must run in the invoking user's context so
+// it uses that user's ssh-agent, keys and known_hosts (root has none of these) —
+// hence User, which launches ssh via `sudo -E -u <User> ssh`.
+type SSH struct {
+	User      string // run ssh as this local user via `sudo -E -u`; "" => plain ssh
+	Identity  string // -i <path> (+ IdentitiesOnly); "" => ssh's default key selection
+	TTY       bool   // -t: allocate a pty so remote sudo/password prompts work
+	BatchMode bool   // -o BatchMode=yes: never prompt, fail instead (key-only checks)
+}
+
+// prefix returns the local argv that launches ssh, up to but not including the
+// destination and remote command. When User is set, ssh is launched via
+// `sudo -E -u <User> ssh` — root can drop to any user without a password, and -E
+// carries SSH_AUTH_SOCK through to that user's ssh-agent.
+func (s SSH) prefix() []string {
+	var argv []string
+	if s.User == "" {
+		argv = append(argv, "ssh")
+	} else {
+		argv = append(argv, "sudo", "-E", "-u", s.User, "ssh")
 	}
-	return []string{"sudo", "-E", "-u", asUser, "ssh"}
+	if s.Identity != "" {
+		// IdentitiesOnly stops ssh from also offering agent/default keys, so the
+		// connection genuinely exercises Identity (matters for setup's verify).
+		argv = append(argv, "-i", s.Identity, "-o", "IdentitiesOnly=yes")
+	}
+	if s.BatchMode {
+		argv = append(argv, "-o", "BatchMode=yes")
+	}
+	if s.TTY {
+		argv = append(argv, "-t")
+	}
+	return argv
 }
 
 // RsyncRemoteShell is the value for rsync's -e (the command rsync uses to reach
-// the destination), launching ssh as asUser the same way sshArgv does. It
-// returns "" when asUser is empty, so the caller leaves rsync's default ssh.
-func RsyncRemoteShell(asUser string) string {
-	if asUser == "" {
+// the destination), launching ssh as User the same way prefix does — but never
+// with a pty, since rsync drives many non-interactive connections. It returns ""
+// when neither User nor Identity is set, so the caller leaves rsync's default ssh.
+func (s SSH) RsyncRemoteShell() string {
+	if s.User == "" && s.Identity == "" {
 		return ""
 	}
-	return strings.Join(sshArgv(asUser), " ")
+	return strings.Join(SSH{User: s.User, Identity: s.Identity}.prefix(), " ")
 }
 
 // RemoteHome resolves $HOME on the destination over ssh. It doubles as a
 // connectivity preflight: a failure here means ssh/Remote Login isn't reachable.
-// ssh runs as asUser (see sshArgv).
-func RemoteHome(ctx context.Context, asUser, dest string) (string, error) {
-	out, err := sshCapture(ctx, asUser, dest, `printf %s "$HOME"`)
+func (s SSH) RemoteHome(ctx context.Context, dest string) (string, error) {
+	out, err := s.Capture(ctx, dest, `printf %s "$HOME"`)
 	if err != nil {
 		return "", err
 	}
@@ -49,8 +73,8 @@ func RemoteHome(ctx context.Context, asUser, dest string) (string, error) {
 }
 
 // RemoteUsername returns the destination login user's short name.
-func RemoteUsername(ctx context.Context, asUser, dest string) (string, error) {
-	out, err := sshCapture(ctx, asUser, dest, "id -un")
+func (s SSH) RemoteUsername(ctx context.Context, dest string) (string, error) {
+	out, err := s.Capture(ctx, dest, "id -un")
 	if err != nil {
 		return "", err
 	}
@@ -65,10 +89,10 @@ func RemoteUsername(ctx context.Context, asUser, dest string) (string, error) {
 // up owned by on the destination: rsync maps the owner by name when the source
 // username happens to exist there, and falls back to the source's numeric uid
 // otherwise.
-func ChownUID(ctx context.Context, asUser, dest, srcUser, srcUID string) (string, error) {
+func (s SSH) ChownUID(ctx context.Context, dest, srcUser, srcUID string) (string, error) {
 	cmd := fmt.Sprintf("id -u %s 2>/dev/null || echo %s",
 		shellescape.Quote(srcUser), shellescape.Quote(srcUID))
-	out, err := sshCapture(ctx, asUser, dest, cmd)
+	out, err := s.Capture(ctx, dest, cmd)
 	if err != nil {
 		return "", err
 	}
@@ -80,8 +104,8 @@ func ChownUID(ctx context.Context, asUser, dest, srcUser, srcUID string) (string
 }
 
 // RunChown runs a job's post-rsync ownership pass on the destination.
-func RunChown(ctx context.Context, asUser, dest string, c *Chown) error {
-	_, err := sshCapture(ctx, asUser, dest, chownCmd(c))
+func (s SSH) RunChown(ctx context.Context, dest string, c *Chown) error {
+	_, err := s.Capture(ctx, dest, chownCmd(c))
 	return err
 }
 
@@ -100,10 +124,10 @@ func chownCmd(c *Chown) string {
 
 // CanSudo reports whether the destination allows passwordless (non-interactive)
 // sudo, which the /Applications and additional-directory transfers require.
-func CanSudo(ctx context.Context, asUser, dest string) bool {
+func (s SSH) CanSudo(ctx context.Context, dest string) bool {
 	// `sudo -n` never prompts: it exits 0 if no password is needed, non-zero
 	// otherwise. RemoteHome has already confirmed ssh connectivity.
-	argv := append(sshArgv(asUser), dest, "sudo -n true")
+	argv := append(s.prefix(), dest, "sudo -n true")
 	return xexec.CommandContext(ctx, argv[0], argv[1:]...).Run() == nil
 }
 
@@ -113,17 +137,17 @@ func CanSudo(ctx context.Context, asUser, dest string) bool {
 // attributes by rsync (running as root), and some roots such as /usr/local are
 // SIP-protected and can't be chowned even by root. Needs passwordless sudo; a
 // no-op in dry-run.
-func PrepareRemoteDir(ctx context.Context, asUser, dest, dir string, dryRun bool) error {
+func (s SSH) PrepareRemoteDir(ctx context.Context, dest, dir string, dryRun bool) error {
 	if dryRun {
 		return nil
 	}
-	_, err := sshCapture(ctx, asUser, dest, "sudo -n mkdir -p "+shellescape.Quote(dir))
+	_, err := s.Capture(ctx, dest, "sudo -n mkdir -p "+shellescape.Quote(dir))
 	return err
 }
 
 // remoteList returns the set of immediate entry names in dir on the destination.
-func remoteList(ctx context.Context, asUser, dest, dir string) (map[string]bool, error) {
-	out, err := sshCapture(ctx, asUser, dest, "cd "+shellescape.Quote(dir)+" && ls -1")
+func (s SSH) remoteList(ctx context.Context, dest, dir string) (map[string]bool, error) {
+	out, err := s.Capture(ctx, dest, "cd "+shellescape.Quote(dir)+" && ls -1")
 	if err != nil {
 		return nil, err
 	}
@@ -136,10 +160,11 @@ func remoteList(ctx context.Context, asUser, dest, dir string) (map[string]bool,
 	return set, nil
 }
 
-// sshCapture runs a single remote command and returns its stdout. ssh runs as
-// asUser (see sshArgv).
-func sshCapture(ctx context.Context, asUser, dest, remoteCmd string) (string, error) {
-	argv := append(sshArgv(asUser), dest, remoteCmd)
+// Capture runs a single remote command and returns its stdout. Use it for
+// non-interactive commands whose output you need; pair it with TTY=false so the
+// pty doesn't fold stderr into stdout.
+func (s SSH) Capture(ctx context.Context, dest, remoteCmd string) (string, error) {
+	argv := append(s.prefix(), dest, remoteCmd)
 	cmd := xexec.CommandContext(ctx, argv[0], argv[1:]...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -151,4 +176,16 @@ func sshCapture(ctx context.Context, asUser, dest, remoteCmd string) (string, er
 		return "", fmt.Errorf("ssh %s: %w", dest, err)
 	}
 	return stdout.String(), nil
+}
+
+// Run executes a single remote command with the process's own stdio wired
+// through, so password and remote-sudo prompts reach the user's terminal. Used
+// by setup/cleanup, which are interactive by nature (pair with TTY=true).
+func (s SSH) Run(ctx context.Context, dest, remoteCmd string) error {
+	argv := append(s.prefix(), dest, remoteCmd)
+	cmd := xexec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }

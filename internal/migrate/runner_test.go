@@ -46,7 +46,7 @@ func TestRunCopiesLocally(t *testing.T) {
 		t.Fatal(err)
 	}
 	jobs := []Job{{Label: "t", Srcs: []string{src + "/"}, Dst: dst + "/"}}
-	results := Run(context.Background(), jobs, 2, disp, "rsync", "", "", false)
+	results := Run(context.Background(), jobs, 2, disp, "rsync", SSH{}, "", false)
 	disp.Close()
 
 	if len(results) != 1 {
@@ -79,7 +79,7 @@ func TestRunPartialExit23(t *testing.T) {
 		t.Fatal(err)
 	}
 	jobs := []Job{{Label: "p", Srcs: []string{"/src/"}, Dst: "/dst/"}}
-	results := Run(context.Background(), jobs, 1, disp, fake, "", "", false)
+	results := Run(context.Background(), jobs, 1, disp, fake, SSH{}, "", false)
 	disp.Close()
 
 	if len(results) != 1 {
