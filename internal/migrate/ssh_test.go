@@ -11,14 +11,14 @@ func TestSSHPrefix(t *testing.T) {
 		ssh  SSH
 		want []string
 	}{
-		{"plain", SSH{}, []string{"ssh"}},
-		{"as user", SSH{User: "alice"}, []string{"sudo", "-E", "-u", "alice", "ssh"}},
-		{"identity", SSH{Identity: "/k"}, []string{"ssh", "-i", "/k", "-o", "IdentitiesOnly=yes"}},
-		{"batch", SSH{Identity: "/k", BatchMode: true}, []string{"ssh", "-i", "/k", "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes"}},
+		{"plain", SSH{}, []string{"ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"}},
+		{"as user", SSH{User: "alice"}, []string{"sudo", "-E", "-u", "alice", "ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"}},
+		{"identity", SSH{Identity: "/k"}, []string{"ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-i", "/k", "-o", "IdentitiesOnly=yes"}},
+		{"batch", SSH{Identity: "/k", BatchMode: true}, []string{"ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-i", "/k", "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes"}},
 		{"control path", SSH{ControlPath: "/tmp/ctl", TTY: true},
-			[]string{"ssh", "-o", "ControlPath=/tmp/ctl", "-t"}},
+			[]string{"ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "ControlPath=/tmp/ctl", "-t"}},
 		{"tty as user with identity", SSH{User: "bob", Identity: "/k", TTY: true},
-			[]string{"sudo", "-E", "-u", "bob", "ssh", "-i", "/k", "-o", "IdentitiesOnly=yes", "-t"}},
+			[]string{"sudo", "-E", "-u", "bob", "ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-i", "/k", "-o", "IdentitiesOnly=yes", "-t"}},
 	}
 	for _, tc := range cases {
 		if got := tc.ssh.prefix(); !reflect.DeepEqual(got, tc.want) {
@@ -33,16 +33,18 @@ func TestRsyncRemoteShell(t *testing.T) {
 		ssh  SSH
 		want string
 	}{
-		{"default", SSH{}, ""},
-		{"as user", SSH{User: "alice"}, "sudo -E -u alice ssh"},
-		{"identity only", SSH{Identity: "/k"}, "ssh -i /k -o IdentitiesOnly=yes"},
+		// Even the zero value carries the host-key options so rsync's default
+		// ssh never refuses on an unknown or stale known_hosts entry.
+		{"default", SSH{}, "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"},
+		{"as user", SSH{User: "alice"}, "sudo -E -u alice ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"},
+		{"identity only", SSH{Identity: "/k"}, "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /k -o IdentitiesOnly=yes"},
 		// A pty must never leak into rsync's remote shell, even if TTY is set.
 		{"tty is dropped", SSH{User: "alice", Identity: "/k", TTY: true},
-			"sudo -E -u alice ssh -i /k -o IdentitiesOnly=yes"},
+			"sudo -E -u alice ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /k -o IdentitiesOnly=yes"},
 		// BatchMode carries over: a transfer connection that can't authenticate
 		// must fail instead of freezing a parallel job on a password prompt.
 		{"batchmode is kept", SSH{User: "alice", BatchMode: true},
-			"sudo -E -u alice ssh -o BatchMode=yes"},
+			"sudo -E -u alice ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes"},
 	}
 	for _, tc := range cases {
 		if got := tc.ssh.RsyncRemoteShell(); got != tc.want {
