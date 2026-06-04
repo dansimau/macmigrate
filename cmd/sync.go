@@ -170,20 +170,16 @@ func runSync(dest string) error {
 	// Create each additional directory (and any missing parents) on the
 	// destination before its contents are copied; rsync sets the ownership of
 	// the entries inside. A directory the migrating user owns locally (e.g.
-	// Homebrew's /opt/homebrew, which `brew` requires be user-owned) is handed
-	// to the destination login user — mkdir alone would leave its node
+	// Homebrew's /opt/homebrew, which `brew` requires be user-owned) has its
+	// node handed to the destination login user — mkdir alone would leave it
 	// root-owned; system-owned roots like /usr/local stay as they are. A prep
 	// failure is fatal — we don't quietly skip work.
 	for _, dir := range dirs {
 		rdir := migrate.RemoteDirPath(syncRoot, syncRemoteRoot, dir)
-		owner := ""
-		if ownedByUID(dir, srcUID) {
-			owner = dstUser
-		}
 		if !syncDryRun {
 			fmt.Printf("Preparing %s on %s …\n", rdir, dest)
 		}
-		if err := ssh.PrepareRemoteDir(ctx, dest, rdir, owner, syncDryRun); err != nil {
+		if err := ssh.PrepareRemoteDir(ctx, dest, rdir, ownedByUID(dir, srcUID), syncDryRun); err != nil {
 			return fail("preparing %s on destination: %v", rdir, err)
 		}
 	}

@@ -145,29 +145,32 @@ func (s SSH) CanSudo(ctx context.Context, dest string) bool {
 // PrepareRemoteDir creates dir (and any missing parents) on the destination so
 // its contents can be copied into it. The entries inside are copied with their
 // own attributes by rsync (running as root), but mkdir creates the directory
-// node itself owned by root — so when owner is non-empty the node is chowned to
-// that destination user. Homebrew's prefix (/opt/homebrew) is owned by the
-// login user on the source and `brew` refuses to run against a root-owned
-// prefix, so its node must be handed back to the user; caller passes "" for
-// roots that should stay as mkdir leaves them — e.g. a SIP-protected
-// /usr/local, which can't be chowned even by root. Needs passwordless sudo; a
-// no-op in dry-run.
-func (s SSH) PrepareRemoteDir(ctx context.Context, dest, dir, owner string, dryRun bool) error {
+// node itself owned by root:wheel — so when toLoginUser is set the node is
+// handed to the destination login user (and their primary group). Homebrew's
+// prefix (/opt/homebrew) is owned by the login user on the source and `brew`
+// refuses to run against a root-owned prefix, so its node must be handed back;
+// callers pass false for roots that should stay as mkdir leaves them — e.g. a
+// SIP-protected /usr/local, which can't be chowned even by root. Needs
+// passwordless sudo; a no-op in dry-run.
+func (s SSH) PrepareRemoteDir(ctx context.Context, dest, dir string, toLoginUser, dryRun bool) error {
 	if dryRun {
 		return nil
 	}
-	_, err := s.Capture(ctx, dest, prepareDirCmd(dir, owner))
+	_, err := s.Capture(ctx, dest, prepareDirCmd(dir, toLoginUser))
 	return err
 }
 
 // prepareDirCmd builds the remote command for PrepareRemoteDir: mkdir -p, then
-// (only when owner is set) a chown of the directory node itself — not its
-// contents, which rsync owns — to owner. The chown is chained with && so a
-// mkdir failure stops before it.
-func prepareDirCmd(dir, owner string) string {
+// (only when toLoginUser is set) a chown of the directory node itself — not its
+// contents, which rsync owns — to the destination login user and primary
+// group. As in chownCmd, `id -un`/`id -gn` are expanded by the login shell
+// before sudo elevates the chown, and -h targets a symlinked prefix node
+// itself rather than dereferencing it. The chown is chained with && so a mkdir
+// failure stops before it.
+func prepareDirCmd(dir string, toLoginUser bool) string {
 	cmd := "sudo -n mkdir -p " + shellescape.Quote(dir)
-	if owner != "" {
-		cmd += " && sudo -n chown " + shellescape.Quote(owner) + " " + shellescape.Quote(dir)
+	if toLoginUser {
+		cmd += ` && sudo -n chown -h "$(id -un):$(id -gn)" ` + shellescape.Quote(dir)
 	}
 	return cmd
 }
