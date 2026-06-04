@@ -35,6 +35,10 @@ agent).
 - Nested includes (e.g. `/opt/homebrew` + `/opt/homebrew/Cellar`) are
   autodetected: the inner tree gets its own parallel jobs, the outer skips it.
 - Everything runs as root on the destination, so ownership survives.
+- Re-runs are incremental and mirror the source: `rsync --delete` prunes
+  destination files that no longer exist locally (within each synced directory).
+  Excluded files (`authorized_keys`, MDM-managed `io.kandji*`, caches) are never
+  deleted.
 - Both Macs are kept awake (`caffeinate`) for the duration.
 
 ## Requirements
