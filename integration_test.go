@@ -612,6 +612,45 @@ func TestIntegrationDirs(t *testing.T) {
 	}
 }
 
+// TestIntegrationDirNodeOwnership covers the directory-node ownership rule
+// PrepareRemoteDir applies. A directory the migrating user owns on the source
+// — Homebrew's /opt/homebrew is the motivating case, since `brew` refuses to
+// run against a root-owned prefix — must arrive with its node owned by the
+// destination login user, not root (which mkdir alone would leave it). A
+// directory owned by root on the source (a stand-in for a SIP-protected
+// /usr/local) keeps its root-owned node: it is never chowned.
+func TestIntegrationDirNodeOwnership(t *testing.T) {
+	f := newFixture(t)
+
+	// A user-owned prefix outside the defaults, brought in with --include and
+	// re-rooted to <remoteRoot>/opt/homebrew. Its node and contents belong to
+	// the source user, as a real /opt/homebrew does.
+	brew := filepath.Join(f.localRoot, "opt", "homebrew")
+	if err := os.MkdirAll(filepath.Join(brew, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(brew, "bin", "brew"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	chownTree(t, brew, testUID, testGID)
+
+	out, code := f.runMigrate(t, "--include", brew)
+	assertSuccess(t, out, code)
+
+	// The user-owned prefix's node is handed to the (destination) login user.
+	remoteBrew := filepath.Join(f.remoteRoot, "opt", "homebrew")
+	if uid, gid := statUIDGID(t, remoteBrew); uid != testUID || gid != testGID {
+		t.Errorf("%s owned by %d:%d, want %d:%d (user-owned prefix not handed to the user)", remoteBrew, uid, gid, testUID, testGID)
+	}
+	assertContent(t, filepath.Join(remoteBrew, "bin", "brew"), "#!/bin/sh\n")
+
+	// usr/local is root-owned at the source (copied as root), so its node is
+	// left as mkdir created it — root-owned, never chowned.
+	if uid, _ := statUIDGID(t, filepath.Join(f.remoteRoot, "usr/local")); uid != 0 {
+		t.Errorf("usr/local node owned by uid %d, want 0 (root-owned source dir must not be chowned)", uid)
+	}
+}
+
 func TestIntegrationDryRun(t *testing.T) {
 	f := newFixture(t)
 	out, code := f.runMigrate(t, "-n")

@@ -11,6 +11,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -145,19 +146,20 @@ func runSync(dest string) error {
 		return sudoRequiredError(dest)
 	}
 
-	// When the usernames differ, the destination can't map the source owner by
-	// name, so each transfer is followed by a chown pass (see migrate.Chown).
-	// Probe once which uid the source user's files arrive as on the destination.
-	var chownUID string
 	dstUser, err := ssh.RemoteUsername(ctx, dest)
 	if err != nil {
 		return fail("resolving destination username: %v", err)
 	}
+	srcUID, err := uidForUser(syncUser)
+	if err != nil {
+		return fail("looking up local user %s: %v", syncUser, err)
+	}
+
+	// When the usernames differ, the destination can't map the source owner by
+	// name, so each transfer is followed by a chown pass (see migrate.Chown).
+	// Probe once which uid the source user's files arrive as on the destination.
+	var chownUID string
 	if dstUser != syncUser {
-		srcUID, err := uidForUser(syncUser)
-		if err != nil {
-			return fail("looking up local user %s: %v", syncUser, err)
-		}
 		chownUID, err = ssh.ChownUID(ctx, dest, syncUser, srcUID)
 		if err != nil {
 			return fail("resolving source uid on destination: %v", err)
@@ -167,13 +169,21 @@ func runSync(dest string) error {
 
 	// Create each additional directory (and any missing parents) on the
 	// destination before its contents are copied; rsync sets the ownership of
-	// the entries inside. A prep failure is fatal — we don't quietly skip work.
+	// the entries inside. A directory the migrating user owns locally (e.g.
+	// Homebrew's /opt/homebrew, which `brew` requires be user-owned) is handed
+	// to the destination login user — mkdir alone would leave its node
+	// root-owned; system-owned roots like /usr/local stay as they are. A prep
+	// failure is fatal — we don't quietly skip work.
 	for _, dir := range dirs {
 		rdir := migrate.RemoteDirPath(syncRoot, syncRemoteRoot, dir)
+		owner := ""
+		if ownedByUID(dir, srcUID) {
+			owner = dstUser
+		}
 		if !syncDryRun {
 			fmt.Printf("Preparing %s on %s …\n", rdir, dest)
 		}
-		if err := ssh.PrepareRemoteDir(ctx, dest, rdir, syncDryRun); err != nil {
+		if err := ssh.PrepareRemoteDir(ctx, dest, rdir, owner, syncDryRun); err != nil {
 			return fail("preparing %s on destination: %v", rdir, err)
 		}
 	}
@@ -338,6 +348,22 @@ func reexecUnderSudo(userFlag string) error {
 		return fail("running under sudo: %v", err)
 	}
 	return nil
+}
+
+// ownedByUID reports whether dir's owner uid equals uid (the decimal string
+// uidForUser returns). It runs as root locally, so the source owner is always
+// readable; a stat error (a dir that vanished between resolveDirs and here)
+// reports false, leaving the directory's node as mkdir creates it.
+func ownedByUID(dir, uid string) bool {
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	return strconv.FormatUint(uint64(st.Uid), 10) == uid
 }
 
 // resolveDirs builds the additional-directory list: defaults that exist locally

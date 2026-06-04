@@ -53,6 +53,41 @@ func TestRsyncRemoteShell(t *testing.T) {
 	}
 }
 
+func TestPrepareDirCmd(t *testing.T) {
+	cases := []struct {
+		name  string
+		dir   string
+		owner string
+		want  string
+	}{
+		{
+			// System-owned roots (e.g. SIP-protected /usr/local) get no chown.
+			name: "no owner",
+			dir:  "/usr/local",
+			want: "sudo -n mkdir -p /usr/local",
+		},
+		{
+			// Homebrew's prefix must be handed back to the login user, or `brew`
+			// refuses to run against a root-owned prefix.
+			name:  "owned prefix",
+			dir:   "/opt/homebrew",
+			owner: "alice",
+			want:  `sudo -n mkdir -p /opt/homebrew && sudo -n chown alice /opt/homebrew`,
+		},
+		{
+			name:  "spaces are quoted",
+			dir:   "/opt/home brew",
+			owner: "new user",
+			want:  `sudo -n mkdir -p '/opt/home brew' && sudo -n chown 'new user' '/opt/home brew'`,
+		},
+	}
+	for _, tc := range cases {
+		if got := prepareDirCmd(tc.dir, tc.owner); got != tc.want {
+			t.Errorf("%s: prepareDirCmd =\n%s\nwant\n%s", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestChownCmd(t *testing.T) {
 	cases := []struct {
 		name string
