@@ -629,6 +629,49 @@ func TestIntegrationDryRun(t *testing.T) {
 	assertAbsent(t, filepath.Join(f.remoteRoot, "Library/Fonts"))
 }
 
+// TestIntegrationIncrementalDelete covers the re-run case: a sync is incremental
+// and may run several times, so --delete must mirror the source — pruning
+// destination files that no longer exist locally. The prune is scoped to
+// directories sent whole (the trailing-slash subdir jobs), so it must NOT touch
+// either excluded files (protected from deletion by default — we never pass
+// --delete-excluded) or the siblings of the explicit-source jobs (loose root
+// files, ~/.ssh), which rsync never enumerates for deletion.
+func TestIntegrationIncrementalDelete(t *testing.T) {
+	f := newFixture(t)
+
+	// First pass seeds the destination from the source.
+	out, code := f.runMigrate(t)
+	assertSuccess(t, out, code)
+	assertContent(t, filepath.Join(f.remoteHome, "Documents/report.txt"), "quarterly report\n")
+
+	// Plant destination-only files, as if the source had deleted them since the
+	// first pass: one inside a mirrored subdir (Documents/, a trailing-slash
+	// subdir job), an excluded file in that same subdir, and a loose file at the
+	// top of $HOME (covered by the explicit-source loose-files job).
+	staleInDir := filepath.Join(f.remoteHome, "Documents/stale.txt")
+	excludedInDir := filepath.Join(f.remoteHome, "Documents/io.kandji.stale.plist")
+	looseSibling := filepath.Join(f.remoteHome, "dest-only.txt")
+	for _, p := range []string{staleInDir, excludedInDir, looseSibling} {
+		if err := os.WriteFile(p, []byte("destination only\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Second pass against the same source: it mirrors.
+	out, code = f.runMigrate(t)
+	assertSuccess(t, out, code)
+
+	// The stale file inside the mirrored directory is pruned...
+	assertAbsent(t, staleInDir)
+	// ...but the excluded file survives (--delete protects excludes by default)...
+	assertExists(t, excludedInDir)
+	// ...and the loose top-level sibling survives: the loose-files job passes
+	// explicit file sources, so rsync performs no deletion in $HOME.
+	assertExists(t, looseSibling)
+	// The source content is of course still present.
+	assertContent(t, filepath.Join(f.remoteHome, "Documents/report.txt"), "quarterly report\n")
+}
+
 // TestIntegrationCrossUserChown migrates to a DIFFERENT destination username —
 // the scenario the post-rsync chown pass exists for. Files owned by the source
 // user must arrive owned by the destination login user (rsync alone would
