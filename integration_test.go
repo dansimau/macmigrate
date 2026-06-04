@@ -160,8 +160,9 @@ func provisionTestUser() error {
 		return err
 	}
 
-	// macmigrate invokes plain `ssh` with no -o options, so everything needed
-	// for a non-interactive connection lives in the test user's config.
+	// macmigrate supplies its own host-key -o options (StrictHostKeyChecking=no,
+	// UserKnownHostsFile=/dev/null), which override the matching lines below; the
+	// rest of what a non-interactive connection needs lives in this config.
 	config := fmt.Sprintf(`Host localhost
   User %s
   IdentityFile %s

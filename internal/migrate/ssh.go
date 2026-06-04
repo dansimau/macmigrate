@@ -34,6 +34,13 @@ func (s SSH) prefix() []string {
 	} else {
 		argv = append(argv, "sudo", "-E", "-u", s.User, "ssh")
 	}
+	// Don't let host-key verification block a migration. The destination is a
+	// machine the user is actively setting up, often freshly reinstalled or
+	// reachable by an IP/name that already has a stale or duplicate entry in
+	// known_hosts — either of which makes ssh refuse to connect. Disabling
+	// strict checking and pointing known_hosts at /dev/null means ssh never
+	// prompts, never stores a key, and never errors on a changed/duplicate one.
+	argv = append(argv, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null")
 	if s.Identity != "" {
 		// IdentitiesOnly stops ssh from also offering agent/default keys, so the
 		// connection genuinely exercises Identity (matters for setup's verify).
@@ -56,12 +63,9 @@ func (s SSH) prefix() []string {
 // with a pty, since rsync drives many non-interactive connections. BatchMode
 // carries over: a transfer connection that can't authenticate must fail
 // loudly, not freeze a parallel job on an invisible password prompt. It
-// returns "" when User, Identity and BatchMode are all unset, so the caller
-// leaves rsync's default ssh.
+// always returns a non-empty shell so rsync's transfer connections inherit the
+// same host-key handling as every other connection (see prefix).
 func (s SSH) RsyncRemoteShell() string {
-	if s.User == "" && s.Identity == "" && !s.BatchMode {
-		return ""
-	}
 	return strings.Join(SSH{User: s.User, Identity: s.Identity, BatchMode: s.BatchMode}.prefix(), " ")
 }
 
