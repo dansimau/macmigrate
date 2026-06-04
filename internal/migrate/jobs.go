@@ -167,8 +167,16 @@ func RemoteDirPath(root, remoteRoot, localDir string) string {
 // with it. (--info=progress2 is interpreted by the local side only.) When the
 // source and destination usernames differ, the transfer is followed by a
 // Chown pass — the flags themselves never change.
+//
+// --delete prunes destination files no longer present at the source, so a sync
+// re-run mirrors the source rather than accumulating files removed since the
+// last pass. It only deletes within directories sent whole — the trailing-slash
+// subdir jobs and the .app bundle jobs — so the explicit-file jobs (loose root
+// files, ~/.ssh entries) can never delete their siblings on the destination.
+// Excluded files (authorized_keys, io.kandji*, Caches) are protected from
+// deletion by default, since we never pass --delete-excluded.
 func (j Job) Args(dryRun bool) []string {
-	args := []string{"-aE", "--info=progress2", "--rsync-path=sudo -n /usr/bin/rsync"}
+	args := []string{"-aE", "--info=progress2", "--delete", "--rsync-path=sudo -n /usr/bin/rsync"}
 	if j.RemoteShell != "" {
 		args = append(args, "-e", j.RemoteShell)
 	}

@@ -13,7 +13,7 @@ func TestJobArgs(t *testing.T) {
 	j := Job{Srcs: []string{"/a/"}, Dst: "h:/b/", Excludes: []string{".DS_Store"}}
 	got := j.Args(true)
 	want := []string{
-		"-aE", "--info=progress2", "--rsync-path=sudo -n /usr/bin/rsync", "--dry-run",
+		"-aE", "--info=progress2", "--delete", "--rsync-path=sudo -n /usr/bin/rsync", "--dry-run",
 		"--exclude=.DS_Store", "--", "/a/", "h:/b/",
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -25,7 +25,7 @@ func TestJobArgsMultiSource(t *testing.T) {
 	j := Job{Srcs: []string{"/r/.gitignore", "/r/README"}, Dst: "h:/r/"}
 	got := j.Args(false)
 	want := []string{
-		"-aE", "--info=progress2", "--rsync-path=sudo -n /usr/bin/rsync",
+		"-aE", "--info=progress2", "--delete", "--rsync-path=sudo -n /usr/bin/rsync",
 		"--", "/r/.gitignore", "/r/README", "h:/r/",
 	}
 	if !reflect.DeepEqual(got, want) {
