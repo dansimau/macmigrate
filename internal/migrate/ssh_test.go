@@ -53,6 +53,42 @@ func TestRsyncRemoteShell(t *testing.T) {
 	}
 }
 
+func TestPrepareDirCmd(t *testing.T) {
+	cases := []struct {
+		name        string
+		dir         string
+		toLoginUser bool
+		want        string
+	}{
+		{
+			// System-owned roots (e.g. SIP-protected /usr/local) get no chown.
+			name: "no handoff",
+			dir:  "/usr/local",
+			want: "sudo -n mkdir -p /usr/local",
+		},
+		{
+			// Homebrew's prefix must be handed back to the login user (and their
+			// primary group), or `brew` refuses to run against a root-owned prefix.
+			// -h leaves a symlinked prefix node itself rather than its target.
+			name:        "handed to login user",
+			dir:         "/opt/homebrew",
+			toLoginUser: true,
+			want:        `sudo -n mkdir -p /opt/homebrew && sudo -n chown -h "$(id -un):$(id -gn)" /opt/homebrew`,
+		},
+		{
+			name:        "spaces are quoted",
+			dir:         "/opt/home brew",
+			toLoginUser: true,
+			want:        `sudo -n mkdir -p '/opt/home brew' && sudo -n chown -h "$(id -un):$(id -gn)" '/opt/home brew'`,
+		},
+	}
+	for _, tc := range cases {
+		if got := prepareDirCmd(tc.dir, tc.toLoginUser); got != tc.want {
+			t.Errorf("%s: prepareDirCmd =\n%s\nwant\n%s", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestChownCmd(t *testing.T) {
 	cases := []struct {
 		name string
