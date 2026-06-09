@@ -105,6 +105,7 @@ func runSync(dest string) error {
 	if err != nil {
 		return fail("%v", err)
 	}
+	files := resolveFiles(syncRoot, migrate.DefaultFiles)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -184,6 +185,26 @@ func runSync(dest string) error {
 		}
 	}
 
+	// Prepare the parent directory of each migrated file (e.g. /etc) on the
+	// destination. These are system directories: their node is left root-owned
+	// (toLoginUser=false), and mkdir -p is idempotent — /etc already exists on
+	// every Mac, so this is a no-op in production and only does real work under
+	// the test roots, where the directory doesn't exist yet.
+	preparedFileDirs := map[string]bool{}
+	for _, file := range files {
+		rdir := path.Dir(migrate.RemoteDirPath(syncRoot, syncRemoteRoot, file))
+		if preparedFileDirs[rdir] {
+			continue
+		}
+		preparedFileDirs[rdir] = true
+		if !syncDryRun {
+			fmt.Printf("Preparing %s on %s …\n", rdir, dest)
+		}
+		if err := ssh.PrepareRemoteDir(ctx, dest, rdir, false, syncDryRun); err != nil {
+			return fail("preparing %s on destination: %v", rdir, err)
+		}
+	}
+
 	opt := migrate.Options{
 		Dest:          dest,
 		SSH:           ssh,
@@ -194,11 +215,13 @@ func runSync(dest string) error {
 		Root:          syncRoot,
 		RemoteRoot:    syncRemoteRoot,
 		Dirs:          dirs,
+		Files:         files,
 		SkipNames:     concat(migrate.DefaultSkip, syncExcludes),
 		RsyncExclude:  migrate.DefaultRsyncExclude,
 		DoHome:        true,
 		DoApps:        true,
 		DoDirs:        len(dirs) > 0,
+		DoFiles:       len(files) > 0,
 		Debug:         debug,
 		ChownUID:      chownUID,
 	}
@@ -389,6 +412,30 @@ func resolveDirs(root string, defaults, extra []string) ([]string, error) {
 		add(d)
 	}
 	return out, nil
+}
+
+// resolveFiles returns the default individual files that exist locally (looked
+// up under root), cleaned and de-duplicated. A missing file is skipped
+// silently — not every Mac has every system file, and a file the destination
+// can do without is not worth failing the migration over (contrast --include
+// dirs, which the user named explicitly and so must exist). Directories are
+// ignored: these are single-file entries (see migrate.DefaultFiles).
+func resolveFiles(root string, defaults []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, f := range defaults {
+		f = filepath.Join(root, f)
+		fi, err := os.Stat(f)
+		if err != nil || fi.IsDir() {
+			continue
+		}
+		f = filepath.Clean(f)
+		if !seen[f] {
+			seen[f] = true
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 var rsyncVersionRE = regexp.MustCompile(`version (\d+)\.(\d+)`)
