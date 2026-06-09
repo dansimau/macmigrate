@@ -276,6 +276,53 @@ func TestBuildJobsChownPaths(t *testing.T) {
 	}
 }
 
+// TestBuildJobsFiles covers the individual-file machinery (DefaultFiles, e.g.
+// /etc/hosts): each file is copied to its matching path under RemoteRoot as an
+// explicit rsync source, grouped one job per parent directory. The explicit
+// source (no trailing slash) is what keeps --delete from pruning the
+// destination directory's other entries; and these system files stay
+// root-owned, so no chown pass is attached even when ChownUID is set.
+func TestBuildJobsFiles(t *testing.T) {
+	root := t.TempDir()
+	etc := filepath.Join(root, "etc")
+	if err := os.MkdirAll(etc, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hosts := filepath.Join(etc, "hosts")
+	if err := os.WriteFile(hosts, []byte("127.0.0.1 localhost\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	opt := Options{
+		Dest: "h", Root: root, RemoteRoot: "/dst",
+		RsyncExclude: DefaultRsyncExclude,
+		DoFiles:      true, Files: []string{hosts},
+		ChownUID: "501", // cross-username, yet system files must not be chowned
+	}
+	jobs, _, err := BuildJobs(context.Background(), opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := labelsOf(jobs); !reflect.DeepEqual(got, []string{"etc (files)"}) {
+		t.Fatalf("labels = %v, want [etc (files)]", got)
+	}
+	j := jobs[0]
+	if !reflect.DeepEqual(j.Srcs, []string{hosts}) {
+		t.Errorf("Srcs = %v, want [%s]", j.Srcs, hosts)
+	}
+	if want := "h:/dst/etc/"; j.Dst != want {
+		t.Errorf("Dst = %q, want %q", j.Dst, want)
+	}
+	if j.Chown != nil {
+		t.Errorf("Chown = %+v, want nil (system files are root-owned)", j.Chown)
+	}
+	for _, s := range j.Srcs {
+		if strings.HasSuffix(s, "/") {
+			t.Errorf("file source %q has a trailing slash; --delete would prune the destination dir", s)
+		}
+	}
+}
+
 func TestRemoteDirPath(t *testing.T) {
 	cases := []struct {
 		root, remoteRoot, localDir, want string

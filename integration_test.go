@@ -651,6 +651,29 @@ func TestIntegrationDirNodeOwnership(t *testing.T) {
 	}
 }
 
+// TestIntegrationFiles covers the individual system-file machinery
+// (migrate.DefaultFiles, e.g. /etc/hosts): the file is picked up from under the
+// local root, its parent directory is created on the destination by
+// PrepareRemoteDir, and the file is copied to the matching path. Because it is
+// sent as an explicit rsync source (not a whole directory), --delete must not
+// prune the destination /etc's pre-existing entries.
+func TestIntegrationFiles(t *testing.T) {
+	f := newFixture(t)
+	out, code := f.runMigrate(t)
+	assertSuccess(t, out, code)
+
+	assertContent(t, filepath.Join(f.remoteRoot, "etc/hosts"),
+		"##\n# Host Database\n##\n127.0.0.1\tlocalhost\n255.255.255.255\tbroadcasthost\n::1             localhost\n10.0.0.5\tmymac.local\n")
+	// The file is root-owned at the source and copied as root; its node must not
+	// be chowned to the login user.
+	if uid, _ := statUIDGID(t, filepath.Join(f.remoteRoot, "etc/hosts")); uid != 0 {
+		t.Errorf("etc/hosts owned by uid %d, want 0 (system file must stay root-owned)", uid)
+	}
+	// An explicit-file transfer must never delete its destination siblings.
+	assertContent(t, filepath.Join(f.remoteRoot, "etc/keepme"),
+		"preexisting destination file that must survive --delete\n")
+}
+
 func TestIntegrationDryRun(t *testing.T) {
 	f := newFixture(t)
 	out, code := f.runMigrate(t, "-n")
@@ -667,6 +690,7 @@ func TestIntegrationDryRun(t *testing.T) {
 	assertAbsent(t, filepath.Join(f.remoteHome, "Documents"))
 	assertAbsent(t, filepath.Join(f.remoteRoot, "Applications/Foo.app"))
 	assertAbsent(t, filepath.Join(f.remoteRoot, "Library/Fonts"))
+	assertAbsent(t, filepath.Join(f.remoteRoot, "etc/hosts"))
 }
 
 // TestIntegrationIncrementalDelete covers the re-run case: a sync is incremental

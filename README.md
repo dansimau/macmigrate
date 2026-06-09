@@ -30,11 +30,15 @@ agent).
 | `/Applications` | Only apps missing on the destination |
 | Homebrew (`/usr/local`, `/opt/homebrew`) | Same absolute path, as root |
 | System `/Library` extras (Fonts, LaunchAgents, …) | Same, when present |
+| System files (`/etc/hosts`) | Same absolute path, as root, when present |
 
 - Add dirs with `--include /path`, skip home entries with `--exclude Library/Foo`.
 - Nested includes (e.g. `/opt/homebrew` + `/opt/homebrew/Cellar`) are
   autodetected: the inner tree gets its own parallel jobs, the outer skips it.
 - Everything runs as root on the destination, so ownership survives.
+- Individual system files (e.g. `/etc/hosts`) are copied to the same path
+  one file at a time, so the destination directory's other entries — and its
+  own owner and mode — are left untouched. Missing files are skipped silently.
 - Re-runs are incremental and mirror the source: `rsync --delete` prunes
   destination files that no longer exist locally (within each synced directory).
   Excluded files (`authorized_keys`, MDM-managed `io.kandji*`, caches) are never

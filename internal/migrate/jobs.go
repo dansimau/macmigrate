@@ -73,6 +73,18 @@ var DefaultDirs = []string{
 	"/Library/Services",
 }
 
+// DefaultFiles are individual absolute files migrated to the same absolute path
+// on the destination, as root, when they exist locally. Unlike DefaultDirs
+// these are single files rather than directory trees: /etc/hosts carries the
+// user's custom hostname mappings across to the new Mac. Each file is copied as
+// an explicit rsync source into its parent directory (see fileJobs), so the
+// parent directory's own owner and mode are never rewritten and rsync's
+// --delete can't prune the directory's other entries — both essential when
+// copying into a shared system directory like /etc.
+var DefaultFiles = []string{
+	"/etc/hosts",
+}
+
 // Job is a single rsync transfer.
 type Job struct {
 	Label       string   // short name shown in the UI and log, e.g. "Documents" or "Library/Mail"
@@ -116,11 +128,13 @@ type Options struct {
 	Root          string   // local root prefix for built-in paths; "" => /
 	RemoteRoot    string   // destination root prefix for built-in paths; "" => /
 	Dirs          []string // additional absolute directories to migrate (re-rooted per Root/RemoteRoot, as root)
+	Files         []string // individual absolute files to migrate (re-rooted per Root/RemoteRoot, as root)
 	SkipNames     []string // home/Library entries to skip (relative to $HOME)
 	RsyncExclude  []string // rsync --exclude patterns applied to every job
 	DoHome        bool
 	DoApps        bool
 	DoDirs        bool
+	DoFiles       bool
 	Debug         bool   // emit diagnostics to stderr (see Debugf)
 	ChownUID      string // uid for the per-job ownership pass (see Chown); "" when the usernames match
 }
@@ -209,6 +223,10 @@ func BuildJobs(ctx context.Context, opt Options) ([]Job, []string, error) {
 			return nil, nil, err
 		}
 		jobs = append(jobs, rjobs...)
+	}
+
+	if opt.DoFiles {
+		jobs = append(jobs, fileJobs(opt)...)
 	}
 
 	var notes []string
@@ -380,6 +398,45 @@ func looseFilesJob(opt Options, label string, files []string, remoteDir string) 
 		RemoteShell: opt.SSH.RsyncRemoteShell(),
 		Chown:       chownFor(opt, remoteDir, false),
 	}
+}
+
+// fileJobs copies the individual files in opt.Files to their matching absolute
+// path on the destination. Files sharing a parent directory are grouped into a
+// single transfer that lists them as explicit rsync sources, so the
+// destination parent directory's own owner and mode are never rewritten and
+// --delete can't prune the directory's other entries — both important when
+// copying into a shared system directory like /etc. These are system files,
+// owned by root, so no per-user chown pass is attached even on a cross-username
+// migration.
+func fileJobs(opt Options) []Job {
+	byDir := map[string][]string{}
+	var order []string
+	for _, f := range opt.Files {
+		f = filepath.Clean(f)
+		remoteDir := path.Dir(RemoteDirPath(opt.Root, opt.RemoteRoot, f))
+		if _, seen := byDir[remoteDir]; !seen {
+			order = append(order, remoteDir)
+		}
+		byDir[remoteDir] = append(byDir[remoteDir], f)
+	}
+
+	var jobs []Job
+	for _, remoteDir := range order {
+		files := byDir[remoteDir]
+		sort.Strings(files)
+		// Label by the parent's path relative to Root (e.g. "etc"), so it stays
+		// stable even when the local root is a temporary test directory.
+		rel := strings.TrimPrefix(RemoteDirPath(opt.Root, "/", path.Dir(files[0])), "/")
+		jobs = append(jobs, Job{
+			Label:       rel + " (files)",
+			Srcs:        files, // explicit file sources: never a trailing-slash dir
+			Dst:         opt.Dest + ":" + ensureSlash(remoteDir),
+			Excludes:    opt.RsyncExclude,
+			RemoteShell: opt.SSH.RsyncRemoteShell(),
+		})
+	}
+	sortJobs(jobs)
+	return jobs
 }
 
 // appJobs lists the destination's /Applications, then creates one sudo-rsync

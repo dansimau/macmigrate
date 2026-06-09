@@ -2,6 +2,9 @@ package cmd
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -33,6 +36,29 @@ func TestReportExitCodes(t *testing.T) {
 	// Interruption wins.
 	if code := reportCode([]migrate.Result{ok, partial}, true); code != 130 {
 		t.Errorf("interrupted exit = %d, want 130", code)
+	}
+}
+
+// TestResolveFiles checks the default-file lookup: files present under the root
+// are returned (cleaned, de-duplicated), while a missing file or a directory is
+// skipped rather than failing the run.
+func TestResolveFiles(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hosts := filepath.Join(root, "etc", "hosts")
+	if err := os.WriteFile(hosts, []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A default that happens to be a directory is ignored (single-file entries only).
+	if err := os.MkdirAll(filepath.Join(root, "etc", "adir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got := resolveFiles(root, []string{"/etc/hosts", "/etc/hosts", "/etc/missing", "/etc/adir"})
+	if want := []string{hosts}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("resolveFiles = %v, want %v", got, want)
 	}
 }
 
